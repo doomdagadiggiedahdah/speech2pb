@@ -1,0 +1,3 @@
+OPENAI_API_KEY=sk-.....
+
+# replace the the "sk-..." with your api key and then rename this file as cred.txt 
