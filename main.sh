@@ -8,11 +8,9 @@
 # - text response / in paste buffer
 # - program ends
 
-
 # replace this directory with your own
 SPOT="/home/mat/Documents/ProgramExperiments/speech2txt_hk"
-arecord -f cd -t wav -d 0 -q -r 44100 $SPOT/recording.wav &
-RECORD_PID=$!
+source $SPOT/cred.txt
 
 transcribe_audio () {
     text=$(curl https://api.openai.com/v1/audio/transcriptions \
@@ -31,20 +29,27 @@ send_perp () {
     echo "sent cowboy"
 }
 
-# popup
-zenity --question --text="Do you want to stop recording?" --ok-label="pb" --cancel-label="perp"
-response=$?
+main () {
+    arecord -f cd -t wav -d 0 -q -r 44100 $SPOT/recording.wav &
+    RECORD_PID=$!
 
-# the thing that makes it all work.
-kill $RECORD_PID
-sleep 1
+    # popup
+    zenity --question --text="Do you want to stop recording?" --ok-label="pb" --cancel-label="perp"
+    response=$?
 
-transcribe_audio
-if [ $response -eq 1 ]; then
-    send_perp
-fi
+    # the thing that makes it all work.
+    kill $RECORD_PID
+    sleep 1
+    transcribe_audio
 
-# parse and pasteBuff
-echo $text
-echo $text | xclip -selection clipboard
-notify-send -t 1000 'Nice' "$text"
+    if [ $response -eq 1 ]; then
+        send_perp
+    else
+        notify-send -t 1000 'Nice' "$text"
+    fi
+
+    #Paste buff for both?
+    echo $text | xclip -selection clipboard
+}
+
+main
