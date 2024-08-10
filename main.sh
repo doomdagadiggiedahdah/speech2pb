@@ -1,39 +1,50 @@
 #!/bin/bash
 
-### Description ###
-# - audio recorder starts / window pops up with button that says "stop" and focus is on the button
-# - press enter
-# - audio is sent to whisper
-# - text result is put into paste buffer
-# - notification of completion pops up
+### Trajectory ###
+# - recorder starts / pop-up with button 
+# - solo; "stop" is its focus
+# - enter to end
+# - audo; *sent* to whisper
+# - text response / in paste buffer
+# - program ends
+
 
 # replace this directory with your own
 SPOT="/home/mat/Documents/ProgramExperiments/speech2txt_hk"
 arecord -f cd -t wav -d 0 -q -r 44100 $SPOT/recording.wav &
 RECORD_PID=$!
 
-# popup
-zenity --question --text="Do you want to stop recording?"
+transcribe_audio () {
+    text=$(curl https://api.openai.com/v1/audio/transcriptions \
+          -H "Authorization: Bearer $OPENAI_API_KEY" \
+          -H "Content-Type: multipart/form-data" \
+          -F file="@$SPOT/recording.wav" \
+          -F model="whisper-1"
+    )
+    text=$(echo $text | jq -r '.text')
+}
 
-# If "Yes" is clicked, kill the recording process
-if [ $? = 0 ]; then
-    kill $RECORD_PID
-fi
+send_perp () {
+    #TODO: send to perp
+    site="https://www.perplexity.ai/?q="
+    firefox "$site$text&focus=internet"
+    echo "sent cowboy"
+}
+
+# popup
+zenity --question --text="Do you want to stop recording?" --ok-label="pb" --cancel-label="perp"
+response=$?
 
 # the thing that makes it all work.
-# needs just a sec to create the new file I guess. lol
+kill $RECORD_PID
 sleep 1
 
-source $SPOT/cred.txt
-text=$(curl https://api.openai.com/v1/audio/transcriptions \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: multipart/form-data" \
-  -F file="@$SPOT/recording.wav" \
-  -F model="whisper-1"
-)
+transcribe_audio
+if [ $response -eq 1 ]; then
+    send_perp
+fi
 
 # parse and pasteBuff
-text=$(echo $text | jq -r '.text')
 echo $text
 echo $text | xclip -selection clipboard
 notify-send -t 1000 'Nice' "$text"
