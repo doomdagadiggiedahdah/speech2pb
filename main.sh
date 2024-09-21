@@ -13,17 +13,56 @@ SPOT="/home/mat/Documents/ProgramExperiments/speech2txt_hk"
 source $SPOT/cred.txt
 
 transcribe_audio () {
-    text=$(curl https://api.openai.com/v1/audio/transcriptions \
+    stt_json=$(curl https://api.openai.com/v1/audio/transcriptions \
           -H "Authorization: Bearer $OPENAI_API_KEY" \
           -H "Content-Type: multipart/form-data" \
           -F file="@$SPOT/recording.wav" \
           -F model="whisper-1"
     )
-    text=$(echo $text | jq -r '.text')
+    stt_result=$(echo $stt_json | jq -r '.text')
 }
 
+format_text () {
+    local stt_output="$1"  # Accept the STT output as an argument
+
+    # Create the formatted message content
+    local message_content="Take the following STT output and apply formatting to make it more 'text friendly'. Add no additional text. Add punctuation, capitalization, remove filler words 'uhh, um' and make ready for text usage: $stt_output"
+
+    # Clean JSON structure with heredoc
+    format_json=$(curl https://api.openai.com/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d @- <<EOF
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "$message_content"
+        }
+      ]
+    }
+  ],
+  "temperature": 1,
+  "max_tokens": 2048,
+  "top_p": 1,
+  "frequency_penalty": 0,
+  "presence_penalty": 0,
+  "response_format": {
+    "type": "text"
+  }
+}
+EOF
+)
+    formatted_result=$(echo $format_json | jq -r '.choices[0].message.content' | sed 's/ You are trained on data up to October 2023\.//')
+}
+
+
+
 send_perp () {
-    #TODO: send to perp
     site="https://www.perplexity.ai/?q="
     firefox "$site$text&focus=internet"
     echo "sent cowboy"
@@ -41,15 +80,19 @@ main () {
     kill $RECORD_PID
     sleep 1
     transcribe_audio
+    echo "$stt_result"
+    sleep 1
+    format_text "$stt_result"
+    echo "$formatted_result"
 
     if [ $response -eq 1 ]; then
         send_perp
     else
-        notify-send -t 1000 'Nice' "$text"
+        notify-send -t 1000 'Nice' "$formatted_result"
     fi
 
     #Paste buff for both?
-    echo $text | xclip -selection clipboard
+    echo $formatted_result | xclip -selection clipboard
 }
 
 main
