@@ -9,7 +9,7 @@
 # - program ends
 
 # replace this directory with your own
-SPOT="/home/mat/Documents/ProgramExperiments/speech2txt_hk"
+SPOT="/home/mat/Documents/ProgramExperiments/stt_hk"
 source $SPOT/cred.txt
 
 transcribe_audio () {
@@ -64,7 +64,7 @@ EOF
 
 send_perp () {
     site="https://www.perplexity.ai/?q="
-    firefox "$site$text&focus=internet"
+    firefox "$site$1"
     echo "sent cowboy"
 }
 
@@ -86,7 +86,7 @@ main () {
     echo "$formatted_result"
 
     if [ $response -eq 1 ]; then
-        send_perp
+        send_perp "$formatted_result"
     else
         notify-send -t 1000 'Nice' "$formatted_result"
     fi
