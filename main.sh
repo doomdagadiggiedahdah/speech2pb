@@ -1,18 +1,12 @@
 #!/bin/bash
 
-### Trajectory ###
-# - recorder starts / pop-up with button 
-# - solo; "stop" is its focus
-# - enter to end
-# - audo; *sent* to whisper
-# - text response / in paste buffer
-# - program ends
-
 # replace this directory with your own
 SPOT="/home/mat/Documents/ProgramExperiments/stt_hk"
 source $SPOT/cred.txt
 
-transcribe_audio () {
+speed_and_transcribe_audio () {
+    ffmpeg -y -i $SPOT/init_recording.wav -filter:a "atempo=2.0" $SPOT/recording.wav
+
     stt_json=$(curl https://api.openai.com/v1/audio/transcriptions \
           -H "Authorization: Bearer $OPENAI_API_KEY" \
           -H "Content-Type: multipart/form-data" \
@@ -69,7 +63,7 @@ send_perp () {
 }
 
 main () {
-    arecord -f cd -t wav -d 0 -q -r 44100 $SPOT/recording.wav &
+    arecord -f cd -t wav -d 0 -q -r 44100 $SPOT/init_recording.wav &
     RECORD_PID=$!
 
     # popup
@@ -79,7 +73,7 @@ main () {
     # the thing that makes it all work.
     kill $RECORD_PID
     sleep .3
-    transcribe_audio
+    speed_and_transcribe_audio 
     echo "$stt_result"
     sleep .3
     format_text "$stt_result"
@@ -96,3 +90,13 @@ main () {
 }
 
 main
+
+
+
+### Trajectory ###
+# - recorder starts / pop-up with button 
+# - solo; "stop" is its focus
+# - enter to end
+# - audo; *sent* to whisper
+# - text response / in paste buffer
+# - program ends
