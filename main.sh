@@ -78,10 +78,10 @@ main () {
 
     # the thing that makes it all work.
     kill $RECORD_PID
-    sleep 1
+    sleep .3
     transcribe_audio
     echo "$stt_result"
-    sleep 1
+    sleep .3
     format_text "$stt_result"
     echo "$formatted_result"
 
