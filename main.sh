@@ -5,7 +5,7 @@ SPOT="/home/mat/Documents/ProgramExperiments/stt_hk"
 source $SPOT/cred.txt
 
 speed_and_transcribe_audio () {
-    ffmpeg -y -i $SPOT/init_recording.wav -filter:a "atempo=2.0" $SPOT/recording.wav
+    ffmpeg -y -i $SPOT/init_recording.wav -filter:a "atempo=1.5" $SPOT/recording.wav
 
     stt_json=$(curl https://api.openai.com/v1/audio/transcriptions \
           -H "Authorization: Bearer $OPENAI_API_KEY" \
