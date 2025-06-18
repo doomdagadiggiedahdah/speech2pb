@@ -10,12 +10,7 @@ DEBUG=0
 OUTPUT_DIR="$SPOT/.recordings"
 mkdir -p "$OUTPUT_DIR"
 
-HISTORY_FILE="$SPOT/.recordings/history.json"
-
-if [[ ! -f "$HISTORY_FILE" ]]; then
-    echo '{"responses":[]}' > "$HISTORY_FILE"
-    #chmod 644 "$HISTORY_FILE"  # Ensure file is readable/writable
-fi
+HISTORY_FILE="$SPOT/.recordings/history.txt"
 
 process_and_transcribe_audio() {
     local timestamp="$1"
@@ -78,7 +73,8 @@ format_text() {
 }
 EOF
 )
-    formatted_result=$(echo $format_json | jq -r '.choices[0].message.content' | sed 's/ You are trained on data up to October 2023\.//')
+    # formatted_result=$(echo $format_json | jq -r '.choices[0].message.content' | sed 's/ You are trained on data up to October 2023\.//')
+    formatted_result=$(echo $format_json | jq -r '.choices[0].message.content')
 }
 
 # Function to update the history file with the latest response
@@ -86,41 +82,11 @@ update_history() {
     local text="$1"
     local timestamp="$(date "+%Y-%m-%d %H:%M:%S")"
     
-    # Make sure history file exists
-    if [[ ! -f "$HISTORY_FILE" ]]; then
-        echo '{"responses":[]}' > "$HISTORY_FILE"
-        chmod 644 "$HISTORY_FILE"  # Ensure file is readable/writable
-    fi
-    
-    # Create the entry as a simple text file first - more reliable
-    echo "$timestamp: $text" >> "$SPOT/.recordings/history.txt"
-    
-    # For json version, do a simple approach
-    if [[ -s "$HISTORY_FILE" ]]; then
-        # Get current contents
-        local contents=$(cat "$HISTORY_FILE")
-        
-        # Simple way to add a new entry at the beginning - might not be perfect JSON
-        # but will be readable by humans if nothing else
-        echo "{\"responses\":[{\"timestamp\":\"$timestamp\",\"text\":\"$text\"}," > "/tmp/new_history.json"
-        cat "$HISTORY_FILE" | grep -o '{\"timestamp\":\"[^}]*}' | head -n 4 >> "/tmp/new_history.json"
-        echo "]}" >> "/tmp/new_history.json"
-        
-        # Copy new file over old one
-        cat "/tmp/new_history.json" > "$HISTORY_FILE"
-    else
-        # Create new history files"
-        echo "History files:"
-        ls -la "$SPOT/.recordings/"
-    fi
+    # Simple text format: append timestamp and text
+    echo "$timestamp: $text" >> "$HISTORY_FILE"
 }
 
 
-send_perp() {
-    site="https://www.perplexity.ai/?q="
-    firefox "$site$1"
-    echo "sent cowboy"
-}
 
 main() {
     # Generate timestamp for this recording session
@@ -128,25 +94,17 @@ main() {
     ORIGINAL_FILE="$OUTPUT_DIR/original_$TIMESTAMP.m4a"
     
     # Check for debug flag in arguments
+    # Debug mode enables: verbose API calls, history file confirmations, and file path display
     if [[ "$1" == "--debug" ]]; then
         DEBUG=1
         echo "Debug mode enabled"
     elif [[ "$1" == "--history" ]]; then
         # Show the history and exit
-        if [[ -f "$SPOT/.recordings/history.txt" ]]; then
+        if [[ -f "$HISTORY_FILE" ]]; then
             echo "Last recorded responses:"
-            cat "$SPOT/.recordings/history.txt"
-            exit 0
-        elif [[ -f "$HISTORY_FILE" ]]; then
-            echo "Last responses from JSON file:"
-            cat "$HISTORY_FILE" | grep -o '{\"timestamp\":\"[^}]*}' | 
-            sed 's/{\"timestamp\":\"//g' | 
-            sed 's/\",\"text\":\"/ - /g' |
-            sed 's/\"}//g'
+            cat "$HISTORY_FILE"
         else
-            echo "No history found. Files do not exist."
-            echo "Current directory structure:"
-            ls -la "$SPOT/.recordings/"
+            echo "No history found. File does not exist: $HISTORY_FILE"
         fi
         exit 0
     fi
@@ -157,8 +115,7 @@ main() {
     RECORD_PID=$!
 
     # popup
-    zenity --question --text="Do you want to stop recording?" --ok-label="pb" --cancel-label="perp"
-    response=$?
+    zenity --info --text="Recording... Click OK to stop"
 
     # the thing that makes it all work.
     kill $RECORD_PID
@@ -180,12 +137,8 @@ main() {
         echo "Added response to history file: $HISTORY_FILE"
     fi
 
-    # Handle user response
-    if [ $response -eq 1 ]; then
-        send_perp "$formatted_result"
-    else
-        notify-send -t 1000 'Nice' "$formatted_result"
-    fi
+    # Show notification
+    notify-send -t 1000 'Nice' "$formatted_result"
 
     # Copy to clipboard
     echo "$formatted_result" | xclip -selection clipboard
