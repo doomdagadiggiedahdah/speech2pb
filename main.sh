@@ -23,7 +23,7 @@ process_and_transcribe_audio() {
     ffmpeg -y -loglevel error -i "$original_file" -filter:a "atempo=1.5" -c:a aac -b:a 192k "$processed_file"
 
     # Send the processed file to Whisper API
-    stt_json=$(curl https://api.openai.com/v1/audio/transcriptions \
+    stt_json=$(curl -s https://api.openai.com/v1/audio/transcriptions \
           -H "Authorization: Bearer $OPENAI_API_KEY" \
           -H "Content-Type: multipart/form-data" \
           -F file="@$processed_file" \
@@ -131,7 +131,6 @@ main() {
     
     # Process the audio file
     process_and_transcribe_audio "$TIMESTAMP"
-    echo "$stt_result"
     sleep .3
     
     # Format the transcription
