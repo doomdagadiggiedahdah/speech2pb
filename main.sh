@@ -123,7 +123,7 @@ main() {
     RECORD_PID=$!
 
     # popup
-    zenity --info --text="Recording... Click OK to stop"
+    zenity --info --text="Speech to Text...Recording"
 
     # the thing that makes it all work.
     kill $RECORD_PID
@@ -144,8 +144,12 @@ main() {
         echo "Added response to history file: $HISTORY_FILE"
     fi
 
-    # Show notification
+    # Non-intrusive feedback - no focus stealing
     notify-send -t 1000 'Nice' "$formatted_result"
+    # Just flash in terminal if available - no popups that steal focus
+    echo -e "\033[32m🎤 STT Complete: copied to clipboard\033[0m" 2>/dev/null || true
+    # Brief system beep for audio confirmation
+    paplay /usr/share/sounds/alsa/Front_Left.wav 2>/dev/null &
 
     # Copy to clipboard
     echo "$formatted_result" | xclip -selection clipboard
