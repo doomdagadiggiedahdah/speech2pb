@@ -29,7 +29,7 @@ process_and_transcribe_audio() {
           -F file="@$processed_file" \
           -F model="whisper-1"
     )
-    stt_result=$(echo $stt_json | jq -r '.text')
+    stt_result=$(echo "$stt_json" | jq -r '.text')
     
     # Check if transcription was successful (not null or empty)
     if [[ -n "$stt_result" && "$stt_result" != "null" ]]; then
@@ -82,7 +82,7 @@ format_text() {
 }
 EOF
 )
-    formatted_result=$(echo $format_json | jq -r '.choices[0].message.content')
+    formatted_result=$(echo "$format_json" | jq -r '.choices[0].message.content')
 }
 
 # Function to update the history file with the latest response
