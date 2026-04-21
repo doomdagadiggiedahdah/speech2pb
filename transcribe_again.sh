@@ -28,7 +28,7 @@ fi
 echo "Transcribing: $AUDIO_FILE"
 
 # Send the audio file to Whisper API and get transcription
-stt_json=$(curl -s https://api.openai.com/v1/audio/transcriptions \
+stt_json=$(curl https://api.openai.com/v1/audio/transcriptions \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -H "Content-Type: multipart/form-data" \
     -F file="@$AUDIO_FILE" \
