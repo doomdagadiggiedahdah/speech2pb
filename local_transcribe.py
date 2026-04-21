@@ -43,7 +43,8 @@ def load_audio_mono_16k(path):
         sr = 16000
     return audio, 16000
 
-def transcribe_array(model, audio, sr, use_vad=True):
+def _transcribe_segments(model, audio, sr, use_vad=True):
+    """Yield segment texts lazily from a numpy audio array."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
         sf.write(f.name, audio, sr)
         segments, _ = model.transcribe(
@@ -56,42 +57,40 @@ def transcribe_array(model, audio, sr, use_vad=True):
             } if (use_vad and not DISABLE_VAD) else None,
             temperature=0.0,
         )
-        return "".join(s.text for s in segments).strip()
+        for segment in segments:
+            yield segment.text
 
-def main(path):
+def transcribe_stream(path):
+    """Yield transcript text pieces as they are decoded (streaming)."""
     audio, sr = load_audio_mono_16k(path)
     if len(audio) == 0:
-        return ""
+        return
 
     model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-
     total_sec = len(audio) / sr
 
-    # If it's short, don't chunk. Just one pass with VAD.
     if total_sec <= CHUNK_SEC * 1.2:
-        return transcribe_array(model, audio, sr, use_vad=True)
+        yield from _transcribe_segments(model, audio, sr, use_vad=True)
+        return
 
-    # For long speech: chunk *after* VAD has already helped on each chunk.
-    texts = []
     start = 0.0
     while start < total_sec:
         end = min(total_sec, start + CHUNK_SEC)
         s = int(start * sr)
         e = int(end * sr)
-        chunk = audio[s:e]
-
-        txt = transcribe_array(model, chunk, sr, use_vad=True)
-        if txt:
-            texts.append(txt)
-
+        yield from _transcribe_segments(model, audio[s:e], sr, use_vad=True)
         if end >= total_sec:
             break
         start = max(0.0, end - OVERLAP_SEC)
 
-    return " ".join(texts).strip()
+def main(path):
+    """Return full transcript as a single string (non-streaming)."""
+    return "".join(transcribe_stream(path)).strip()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("usage: local_transcribe.py audiofile", file=sys.stderr)
         sys.exit(2)
-    print(main(sys.argv[1]))
+    for text in transcribe_stream(sys.argv[1]):
+        print(text, end="", flush=True)
+    print()  # final newline
