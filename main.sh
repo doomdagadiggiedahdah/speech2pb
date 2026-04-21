@@ -16,31 +16,21 @@ mkdir -p "$OUTPUT_DIR" "$AUDIO_DIR" "$TRANSCRIPT_DIR"
 process_and_transcribe_audio() {
   local timestamp="$1"
   local original_file="$AUDIO_DIR/original_$timestamp.m4a"
-  local processed_file="$AUDIO_DIR/processed_$timestamp.m4a"
 
-  # Create a speed-processed version while preserving the original
-  # This speeds up the audio by 1.5x as in the original script
-  ffmpeg -y -loglevel error -i "$original_file" -filter:a "atempo=1.5" -c:a aac -b:a 192k "$processed_file"
-
-  # Send the processed file to Whisper API
-  stt_json=$(
-    curl -s https://api.openai.com/v1/audio/transcriptions \
-      -H "Authorization: Bearer $OPENAI_API_KEY" \
-      -H "Content-Type: multipart/form-data" \
-      -F file="@$processed_file" \
-      -F model="whisper-1"
+  # Transcribe locally with whisper large-v3 on GPU
+  stt_result=$(
+    FW_MODEL=large-v3 FW_DEVICE=cuda FW_COMPUTE=int8 \
+    "$SPOT/.venv/bin/python" "$SPOT/local_transcribe.py" "$original_file"
   )
-  stt_result=$(echo "$stt_json" | jq -r '.text')
+
+  # echo "[STT raw] $stt_result" >&2 # debug: log raw STT output
 
   # Check if transcription was successful (not null or empty)
-  if [[ -n "$stt_result" && "$stt_result" != "null" ]]; then
+  if [[ -n "$stt_result" ]]; then
     # Save the raw transcription to a text file
     echo "$stt_result" >"$TRANSCRIPT_DIR/raw_transcript_$timestamp.txt"
-
-    # Delete the processed audio file after successful transcription
-    rm "$processed_file"
   else
-    echo "Error: Transcription failed, keeping processed file: $processed_file"
+    echo "Error: Transcription failed for $original_file" >&2
   fi
 }
 
