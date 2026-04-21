@@ -128,7 +128,7 @@ main() {
       --text="Recording..." \
       --ok-label="Copy" \
       --cancel-label="Chat" \
-      --width=300 2>/dev/null
+      --width=200 --height=80 2>/dev/null
   OPEN_CHAT=$?
 
   # the thing that makes it all work.
