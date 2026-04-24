@@ -13,26 +13,6 @@ AUDIO_DIR="$OUTPUT_DIR/audio"
 TRANSCRIPT_DIR="$OUTPUT_DIR/transcripts"
 mkdir -p "$OUTPUT_DIR" "$AUDIO_DIR" "$TRANSCRIPT_DIR"
 
-process_and_transcribe_audio() {
-  local timestamp="$1"
-  local original_file="$AUDIO_DIR/original_$timestamp.m4a"
-
-  # Transcribe locally with whisper large-v3 on GPU
-  stt_result=$(
-    FW_MODEL=large-v3 FW_DEVICE=cuda FW_COMPUTE=int8 \
-    "$SPOT/.venv/bin/python" "$SPOT/local_transcribe.py" "$original_file"
-  )
-
-  # echo "[STT raw] $stt_result" >&2 # debug: log raw STT output
-
-  # Check if transcription was successful (not null or empty)
-  if [[ -n "$stt_result" ]]; then
-    # Save the raw transcription to a text file
-    echo "$stt_result" >"$TRANSCRIPT_DIR/raw_transcript_$timestamp.txt"
-  else
-    echo "Error: Transcription failed for $original_file" >&2
-  fi
-}
 
 format_text() {
   local stt_output="$1" # Accept the STT output as an argument
@@ -107,10 +87,20 @@ main() {
     exit 0
   fi
 
-  # Start recording with the timestamped filename directly to m4a format
-  # Note: arecord doesn't support m4a directly, so we'll use ffmpeg for recording
+  # Determine the sped-up file path ahead of time so the preloader can wait for it
+  local sped_up_file="$AUDIO_DIR/fast_$TIMESTAMP.m4a"
+  local stt_output_file=$(mktemp)
+
+  # Start recording
   ffmpeg -y -loglevel error -f alsa -i default -c:a aac -b:a 192k -ar 44100 "$ORIGINAL_FILE" &
   RECORD_PID=$!
+
+  # Preload whisper model in background — it will wait for the sped-up file to appear.
+  # nohup prevents SIGHUP from zenity closing from killing it; we can still wait on the PID.
+  FW_MODEL=small FW_DEVICE=cuda FW_COMPUTE=int8_float16 \
+    nohup "$SPOT/.venv/bin/python" "$SPOT/local_transcribe.py" "$sped_up_file" --wait \
+    > "$stt_output_file" 2>>"$OUTPUT_DIR/whisper_preload.log" &
+  WHISPER_PID=$!
 
   # popup — user decides what to do with the result before stopping
   zenity --question \
@@ -121,13 +111,23 @@ main() {
       --width=200 --height=80 2>/dev/null
   OPEN_CHAT=$?
 
-  # the thing that makes it all work.
+  # Stop recording
   kill $RECORD_PID
   sleep .3
 
-  # Process the audio file
-  process_and_transcribe_audio "$TIMESTAMP"
-  sleep .3
+  # Run atempo and write the sped-up file — whisper is already loaded and waiting for it
+  ffmpeg -y -loglevel error -i "$ORIGINAL_FILE" -filter:a "atempo=1.5" "$sped_up_file"
+
+  # Wait for whisper to finish
+  wait $WHISPER_PID
+  stt_result=$(cat "$stt_output_file")
+  rm -f "$stt_output_file"
+
+  if [[ -n "$stt_result" ]]; then
+    echo "$stt_result" >"$TRANSCRIPT_DIR/raw_transcript_$TIMESTAMP.txt"
+  else
+    echo "Error: Transcription failed for $ORIGINAL_FILE" >&2
+  fi
 
   # Format the transcription
   format_text "$stt_result" "$TIMESTAMP"
