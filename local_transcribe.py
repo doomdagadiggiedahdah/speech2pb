@@ -60,13 +60,14 @@ def _transcribe_segments(model, audio, sr, use_vad=True):
         for segment in segments:
             yield segment.text
 
-def transcribe_stream(path):
+def transcribe_stream(path, model=None):
     """Yield transcript text pieces as they are decoded (streaming)."""
     audio, sr = load_audio_mono_16k(path)
     if len(audio) == 0:
         return
 
-    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+    if model is None:
+        model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
     total_sec = len(audio) / sr
 
     if total_sec <= CHUNK_SEC * 1.2:
@@ -89,8 +90,25 @@ def main(path):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: local_transcribe.py audiofile", file=sys.stderr)
+        print("usage: local_transcribe.py audiofile [--wait]", file=sys.stderr)
         sys.exit(2)
-    for text in transcribe_stream(sys.argv[1]):
-        print(text, end="", flush=True)
+
+    audio_path = sys.argv[1]
+    wait_mode = "--wait" in sys.argv
+
+    if wait_mode:
+        # Preload model immediately, then wait for the audio file to appear.
+        # This lets main.sh start us in the background during recording so
+        # model load time overlaps with the user speaking.
+        import time
+        model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+        print("[model loaded]", file=sys.stderr, flush=True)
+        while not os.path.exists(audio_path):
+            time.sleep(0.1)
+        for text in transcribe_stream(audio_path, model=model):
+            print(text, end="", flush=True)
+    else:
+        for text in transcribe_stream(audio_path):
+            print(text, end="", flush=True)
+
     print()  # final newline
