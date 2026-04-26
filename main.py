@@ -85,6 +85,26 @@ def _log(msg):
     if DEBUG:
         print(f"[debug] {msg}", file=sys.stderr)
 
+# ── perf timing ───────────────────────────────────────────────────────────────
+_perf: dict[str, float] = {}
+_perf_t0 = datetime.now()
+
+def _tick(label: str):
+    """Record elapsed seconds since last _tick (or script start) under label."""
+    global _perf_t0
+    now = datetime.now()
+    _perf[label] = (now - _perf_t0).total_seconds()
+    _perf_t0 = now
+
+def _log_perf_summary():
+    total = sum(_perf.values())
+    lines = ["--- perf summary ---"]
+    for label, secs in _perf.items():
+        bar = "#" * max(1, round(secs / max(_perf.values()) * 20))
+        lines.append(f"  {secs:5.2f}s  {bar:<20}  {label}")
+    lines.append(f"  {total:5.2f}s  total (excl. recording)")
+    _log("\n".join(lines))
+
 # ── recording ─────────────────────────────────────────────────────────────────
 def record_until_stopped():
     """Returns numpy float32 mono audio array recorded until stop_event is set."""
@@ -248,8 +268,12 @@ def _maybe_remind_analysis(total_runs: int):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
+    global _perf_t0
+    _perf_t0 = datetime.now()  # reset timer at true start
+
     # 1. Launch Zenity immediately — before any heavy work
     dialog_proc = launch_dialog()
+    _tick("startup → zenity shown")
 
     creds = load_creds()
     api_key = creds.get("OPENAI_API_KEY", "")
@@ -267,6 +291,7 @@ def main():
     fast_file     = AUDIO_DIR / f"fast_{timestamp}.wav"
 
     # 2. Start model loading immediately
+    model_load_start = datetime.now()
     threading.Thread(target=_load_model, daemon=True).start()
 
     # 3. Start recording
@@ -285,6 +310,8 @@ def main():
         print("No audio recorded.", file=sys.stderr)
         sys.exit(1)
 
+    _perf_t0 = datetime.now()  # start timing post-recording work from here
+
     import numpy as np
     audio = np.concatenate(chunks)
     audio_secs = len(audio) / SAMPLE_RATE
@@ -292,20 +319,31 @@ def main():
 
     # 6. Save original + apply atempo
     save_m4a(audio, original_file)
-    _log(f"saved original: {original_file.name}")
+    _tick("save m4a")
 
     import soundfile as sf
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         sf.write(tmp.name, audio, SAMPLE_RATE)
         apply_atempo(Path(tmp.name), fast_file, ATEMPO)
         os.unlink(tmp.name)
+    _tick("atempo")
     _log(f"atempo {ATEMPO}x applied")
+
+    # Time how long we block waiting for the model (ideally 0 if recording was long enough)
+    model_wait_start = datetime.now()
+    model_ready.wait()
+    model_wait_secs = (datetime.now() - model_wait_start).total_seconds()
+    model_load_secs = (datetime.now() - model_load_start).total_seconds()
+    _perf["model wait (blocked)"] = model_wait_secs
+    _perf_t0 = datetime.now()
+    _log(f"model ready (total load {model_load_secs:.2f}s, blocked {model_wait_secs:.2f}s)")
 
     # 7–10. Transcribe → format → clipboard → notify (with retry on failure)
     for attempt in range(1, 4):
         try:
             _log(f"transcribing (attempt {attempt})...")
             stt_result, transcribe_secs, rtf = transcribe(fast_file, audio_secs)
+            _tick("whisper transcribe")
             if not stt_result:
                 raise RuntimeError("transcription returned empty result")
             _log(f"transcript: {stt_result[:60]}...")
@@ -318,6 +356,9 @@ def main():
 
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=formatted.encode(), check=True)
+            _tick("clipboard + history")
+
+            _log_perf_summary()
 
             if not open_chat:
                 subprocess.run(["notify-send", "-t", "2000", "STT", formatted])
