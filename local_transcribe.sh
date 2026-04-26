@@ -36,7 +36,7 @@ process_and_transcribe_audio() {
     export VAD_MIN_SILENCE_MS="300"
     export VAD_SPEECH_PAD_MS="200"
 
-    stt_result=$("$SPOT/local_transcribe.py" "$processed_file")
+    stt_result=$("$SPOT/parakeet_transcribe.py" "$processed_file")
 
     if [[ -n "$stt_result" && "$stt_result" != "null" ]]; then
         echo "$stt_result" > "$TRANSCRIPT_DIR/raw_transcript_$timestamp.txt"
