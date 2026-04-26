@@ -63,9 +63,10 @@ def load_creds():
                 creds[k.strip()] = v.strip()
     return creds
 
-# ── model preload ──────────────────────────────────────────────────────────────
+# ── model preload (fallback when daemon is not running) ──────────────────────
 model = None
 model_ready = threading.Event()
+use_daemon = False  # set in main() after checking daemon availability
 
 def _load_model():
     global model
@@ -147,11 +148,18 @@ def save_m4a(audio, path: Path):
 
 # ── transcription ─────────────────────────────────────────────────────────────
 def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, float]:
-    """Returns (text, elapsed_secs, rtf)."""
-    model_ready.wait()  # block only if model isn't loaded yet
-    import local_transcribe as lt
+    """Returns (text, elapsed_secs, rtf). Uses daemon if available, else local model."""
     t0 = datetime.now()
-    result = "".join(lt.transcribe_stream(str(audio_path), model=model)).strip()
+    if use_daemon:
+        import stt_client
+        resp = stt_client.send_transcribe(str(audio_path))
+        if "error" in resp:
+            raise RuntimeError(f"daemon error: {resp['error']}")
+        result = resp["text"]
+    else:
+        model_ready.wait()
+        import local_transcribe as lt
+        result = "".join(lt.transcribe_stream(str(audio_path), model=model)).strip()
     elapsed = (datetime.now() - t0).total_seconds()
     rtf = elapsed / original_secs if original_secs > 0 else 0
     _log(f"transcription done in {elapsed:.2f}s (audio: {original_secs:.1f}s, rtf: {rtf:.2f}x)")
@@ -290,9 +298,17 @@ def main():
     original_file = AUDIO_DIR / f"original_{timestamp}.m4a"
     fast_file     = AUDIO_DIR / f"fast_{timestamp}.wav"
 
-    # 2. Start model loading immediately
-    model_load_start = datetime.now()
-    threading.Thread(target=_load_model, daemon=True).start()
+    # 2. Use daemon if running (send preload now), otherwise load model in background
+    global use_daemon
+    import stt_client
+    if stt_client.is_running():
+        use_daemon = True
+        model_ready.set()  # no local waiting needed
+        stt_client.send_preload()
+        _log("using stt_daemon — preload sent")
+    else:
+        model_load_start = datetime.now()
+        threading.Thread(target=_load_model, daemon=True).start()
 
     # 3. Start recording
     stream, chunks, _ = record_until_stopped()
@@ -330,13 +346,16 @@ def main():
     _log(f"atempo {ATEMPO}x applied")
 
     # Time how long we block waiting for the model (ideally 0 if recording was long enough)
-    model_wait_start = datetime.now()
-    model_ready.wait()
-    model_wait_secs = (datetime.now() - model_wait_start).total_seconds()
-    model_load_secs = (datetime.now() - model_load_start).total_seconds()
-    _perf["model wait (blocked)"] = model_wait_secs
-    _perf_t0 = datetime.now()
-    _log(f"model ready (total load {model_load_secs:.2f}s, blocked {model_wait_secs:.2f}s)")
+    if not use_daemon:
+        model_wait_start = datetime.now()
+        model_ready.wait()
+        model_wait_secs = (datetime.now() - model_wait_start).total_seconds()
+        model_load_secs = (datetime.now() - model_load_start).total_seconds()
+        _perf["model wait (blocked)"] = model_wait_secs
+        _perf_t0 = datetime.now()
+        _log(f"model ready (total load {model_load_secs:.2f}s, blocked {model_wait_secs:.2f}s)")
+    else:
+        _perf_t0 = datetime.now()
 
     # 7–10. Transcribe → format → clipboard → notify (with retry on failure)
     for attempt in range(1, 4):
