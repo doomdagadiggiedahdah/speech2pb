@@ -13,29 +13,6 @@ AUDIO_DIR="$OUTPUT_DIR/audio"
 TRANSCRIPT_DIR="$OUTPUT_DIR/transcripts"
 mkdir -p "$OUTPUT_DIR" "$AUDIO_DIR" "$TRANSCRIPT_DIR"
 
-process_and_transcribe_audio() {
-    local timestamp="$1"
-    local original_file="$AUDIO_DIR/original_$timestamp.m4a"
-    local processed_file="$AUDIO_DIR/processed_$timestamp.wav"
-    local parakeet_pid="$2"
-    local result_file="$3"
-
-    # Convert to wav 16k mono — this is what parakeet --wait is waiting for
-    ffmpeg -y -loglevel error -i "$original_file" -ac 1 -ar 16000 "$processed_file"
-
-    # Wait for the background parakeet process to finish
-    wait "$parakeet_pid"
-    stt_result=$(cat "$result_file")
-    rm -f "$result_file"
-
-    if [[ -n "$stt_result" && "$stt_result" != "null" ]]; then
-        echo "$stt_result" > "$TRANSCRIPT_DIR/raw_transcript_$timestamp.txt"
-        [[ $DEBUG -eq 0 ]] && rm "$processed_file"
-    else
-        echo "Error: Parakeet transcription failed; keeping processed file: $processed_file"
-    fi
-}
-
 
 format_text() {
     local stt_output="$1"  # Accept the STT output as an argument
@@ -111,28 +88,36 @@ main() {
         exit 0
     fi
     
-    # Pre-determine the processed wav path so parakeet can wait for it
-    PROCESSED_FILE="$AUDIO_DIR/processed_$TIMESTAMP.wav"
-    RESULT_TMP=$(mktemp)
-
-    # Start parakeet in background — model loads while user is speaking
     source "$SPOT/.venv/bin/activate"
-    "$SPOT/parakeet_transcribe.py" "$PROCESSED_FILE" --wait >"$RESULT_TMP" 2>/dev/null &
+    RESULT_TMP=$(mktemp)
+    FIFO=$(mktemp -u)
+    mkfifo "$FIFO"
+
+    # parakeet_eager.py reads raw PCM from the fifo; model loads while recording,
+    # chunks are transcribed eagerly so post-recording work is minimal
+    "$SPOT/parakeet_eager.py" <"$FIFO" >"$RESULT_TMP" 2>/dev/null &
     PARAKEET_PID=$!
 
-    # Start recording
-    ffmpeg -y -loglevel error -f alsa -i default -c:a aac -b:a 192k -ar 44100 "$ORIGINAL_FILE" &
+    # ffmpeg records and writes raw 16kHz mono PCM to the fifo
+    ffmpeg -y -loglevel error -f alsa -i default -ar 16000 -ac 1 -f f32le "$FIFO" &
     RECORD_PID=$!
 
-    # popup
+    # popup — user speaks here, parakeet streams in background
     zenity --info --text="Speech to Text...Recording"
 
-    # Stop recording
+    # Stop recording → EOF on fifo → parakeet finalises
     kill $RECORD_PID
-    sleep .3
+    wait $PARAKEET_PID
+    rm -f "$FIFO"
 
-    # Convert audio (this creates $PROCESSED_FILE, which wakes up parakeet)
-    process_and_transcribe_audio "$TIMESTAMP" "$PARAKEET_PID" "$RESULT_TMP"
+    stt_result=$(cat "$RESULT_TMP")
+    rm -f "$RESULT_TMP"
+
+    if [[ -n "$stt_result" && "$stt_result" != "null" ]]; then
+        echo "$stt_result" > "$TRANSCRIPT_DIR/raw_transcript_$TIMESTAMP.txt"
+    else
+        echo "Error: Parakeet transcription failed"
+    fi
     sleep .3
     
     # Format the transcription

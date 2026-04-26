@@ -28,7 +28,7 @@ FW_COMPUTE   = os.environ.get("FW_COMPUTE", "int8_float16")
 ATEMPO       = float(os.environ.get("ATEMPO", "1.5"))
 
 # ── model rotation ────────────────────────────────────────────────────────────
-BENCH_MODELS        = ["turbo"]
+BENCH_MODELS        = ["distil-large-v3"]
 BENCH_SAMPLES_EACH  = 30
 BENCH_STATE_FILE    = None  # set after OUTPUT_DIR is known
 
