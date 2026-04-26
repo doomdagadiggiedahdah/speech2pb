@@ -17,32 +17,22 @@ process_and_transcribe_audio() {
     local timestamp="$1"
     local original_file="$AUDIO_DIR/original_$timestamp.m4a"
     local processed_file="$AUDIO_DIR/processed_$timestamp.wav"
+    local parakeet_pid="$2"
+    local result_file="$3"
 
-    # Convert to wav 16k mono for faster-whisper
+    # Convert to wav 16k mono — this is what parakeet --wait is waiting for
     ffmpeg -y -loglevel error -i "$original_file" -ac 1 -ar 16000 "$processed_file"
 
-    # Activate uv venv
-    source "$SPOT/.venv/bin/activate"
-
-    # Tuning defaults (safe for 4GB)
-    export FW_MODEL="small"
-    export FW_DEVICE="cuda"
-    export FW_COMPUTE="int8_float16"
-    export CHUNK_SEC="8.0"
-    export OVERLAP_SEC="0.8"
-    export BEAM_SIZE="3"
-
-    # VAD knobs (optional)
-    export VAD_MIN_SILENCE_MS="300"
-    export VAD_SPEECH_PAD_MS="200"
-
-    stt_result=$("$SPOT/parakeet_transcribe.py" "$processed_file")
+    # Wait for the background parakeet process to finish
+    wait "$parakeet_pid"
+    stt_result=$(cat "$result_file")
+    rm -f "$result_file"
 
     if [[ -n "$stt_result" && "$stt_result" != "null" ]]; then
         echo "$stt_result" > "$TRANSCRIPT_DIR/raw_transcript_$timestamp.txt"
         [[ $DEBUG -eq 0 ]] && rm "$processed_file"
     else
-        echo "Error: Local transcription failed; keeping processed file: $processed_file"
+        echo "Error: Parakeet transcription failed; keeping processed file: $processed_file"
     fi
 }
 
@@ -121,20 +111,28 @@ main() {
         exit 0
     fi
     
-    # Start recording with the timestamped filename directly to m4a format
-    # Note: arecord doesn't support m4a directly, so we'll use ffmpeg for recording
+    # Pre-determine the processed wav path so parakeet can wait for it
+    PROCESSED_FILE="$AUDIO_DIR/processed_$TIMESTAMP.wav"
+    RESULT_TMP=$(mktemp)
+
+    # Start parakeet in background — model loads while user is speaking
+    source "$SPOT/.venv/bin/activate"
+    "$SPOT/parakeet_transcribe.py" "$PROCESSED_FILE" --wait >"$RESULT_TMP" 2>/dev/null &
+    PARAKEET_PID=$!
+
+    # Start recording
     ffmpeg -y -loglevel error -f alsa -i default -c:a aac -b:a 192k -ar 44100 "$ORIGINAL_FILE" &
     RECORD_PID=$!
 
     # popup
     zenity --info --text="Speech to Text...Recording"
 
-    # the thing that makes it all work.
+    # Stop recording
     kill $RECORD_PID
     sleep .3
-    
-    # Process the audio file
-    process_and_transcribe_audio "$TIMESTAMP"
+
+    # Convert audio (this creates $PROCESSED_FILE, which wakes up parakeet)
+    process_and_transcribe_audio "$TIMESTAMP" "$PARAKEET_PID" "$RESULT_TMP"
     sleep .3
     
     # Format the transcription
