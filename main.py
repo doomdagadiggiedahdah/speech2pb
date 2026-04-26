@@ -28,7 +28,7 @@ FW_COMPUTE   = os.environ.get("FW_COMPUTE", "int8_float16")
 ATEMPO       = float(os.environ.get("ATEMPO", "1.5"))
 
 # ── model rotation ────────────────────────────────────────────────────────────
-BENCH_MODELS        = ["small", "medium", "large-v3", "large-v3-turbo"]
+BENCH_MODELS        = ["turbo"]
 BENCH_SAMPLES_EACH  = 30
 BENCH_STATE_FILE    = None  # set after OUTPUT_DIR is known
 
@@ -76,6 +76,7 @@ def _load_model():
         _log(f"model loaded ({FW_MODEL}/{FW_DEVICE}/{FW_COMPUTE}) in {(datetime.now()-t0).total_seconds():.2f}s")
     except Exception as e:
         _log(f"model load error: {e}")
+        _notify_error(f"model failed to load: {e}")
     model_ready.set()
 
 def _log(msg):
@@ -176,6 +177,20 @@ def wait_dialog(proc: subprocess.Popen) -> int:
     """Returns 0 for Copy, 1 for Chat."""
     proc.wait()
     return proc.returncode
+
+# ── error handling ────────────────────────────────────────────────────────────
+def _notify_error(msg: str):
+    _log(f"ERROR: {msg}")
+    subprocess.Popen(["notify-send", "-t", "8000", "-u", "critical", "stt_hk failed", msg])
+
+def _ask_retry() -> bool:
+    result = subprocess.run([
+        "zenity", "--question",
+        "--title=stt_hk", "--text=Pipeline failed. Retry?",
+        "--ok-label=Retry", "--cancel-label=Abort",
+        "--width=220", "--height=80",
+    ], capture_output=True)
+    return result.returncode == 0
 
 # ── history ───────────────────────────────────────────────────────────────────
 def update_history(text: str):
@@ -286,38 +301,41 @@ def main():
         os.unlink(tmp.name)
     _log(f"atempo {ATEMPO}x applied")
 
-    # 7. Transcribe (model_ready.wait() inside — overlapped with steps 3–6)
-    _log("transcribing...")
-    stt_result, transcribe_secs, rtf = transcribe(fast_file, audio_secs)
-    _log(f"transcript: {stt_result[:60]}...")
+    # 7–10. Transcribe → format → clipboard → notify (with retry on failure)
+    for attempt in range(1, 4):
+        try:
+            _log(f"transcribing (attempt {attempt})...")
+            stt_result, transcribe_secs, rtf = transcribe(fast_file, audio_secs)
+            if not stt_result:
+                raise RuntimeError("transcription returned empty result")
+            _log(f"transcript: {stt_result[:60]}...")
+            (TRANSCRIPT_DIR / f"raw_transcript_{timestamp}.txt").write_text(stt_result)
 
-    if not stt_result:
-        print("Transcription failed.", file=sys.stderr)
-        sys.exit(1)
+            _log("formatting with GPT...")
+            formatted = format_text(stt_result, api_key)
+            _log(f"formatted: {formatted[:60]}...")
 
-    (TRANSCRIPT_DIR / f"raw_transcript_{timestamp}.txt").write_text(stt_result)
+            print(formatted)
+            update_history(formatted)
 
-    # 8. GPT formatting
-    _log("formatting with GPT...")
-    formatted = format_text(stt_result, api_key)
-    _log(f"formatted: {formatted[:60]}...")
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=formatted.encode(), check=True)
 
-    print(formatted)
-    update_history(formatted)
+            if not open_chat:
+                subprocess.run(["notify-send", "-t", "2000", "STT", formatted])
+            else:
+                subprocess.Popen([sys.executable, str(SPOT / "stt_chat.py"), formatted])
+            break  # success
 
-    # 9. Clipboard
-    subprocess.run(["xclip", "-selection", "clipboard"],
-                   input=formatted.encode(), check=True)
+        except Exception as e:
+            _notify_error(f"attempt {attempt}: {e}")
+            if attempt == 3 or not _ask_retry():
+                _log("aborted after failure")
+                sys.exit(1)
 
-    # 10. Notify or open chat
-    if not open_chat:
-        subprocess.run(["notify-send", "-t", "2000", "STT", formatted])
-    else:
-        subprocess.Popen([sys.executable, str(SPOT / "stt_chat.py"), formatted])
-
-    # 11. Feedback + milestone reminder
-    ask_and_record_feedback(timestamp, FW_MODEL, audio_secs, rtf)
-    _maybe_remind_analysis(total_runs)
+    # 11. Feedback + milestone reminder (disabled)
+    # ask_and_record_feedback(timestamp, FW_MODEL, audio_secs, rtf)
+    # _maybe_remind_analysis(total_runs)
 
     if DEBUG:
         print(f"original: {original_file}", file=sys.stderr)
