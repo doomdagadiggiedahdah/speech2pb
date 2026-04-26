@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""
+stt_client — send commands to stt_daemon.
+
+Usage:
+    ./stt_client.py preload                # tell daemon to start loading model
+    ./stt_client.py transcribe audio.wav   # transcribe (waits for model + queue)
+    ./stt_client.py status                 # check daemon state
+    ./stt_client.py unload                 # free GPU memory
+"""
+import json, socket, sys
+from pathlib import Path
+
+SOCKET_PATH = Path(__file__).parent / ".output" / "stt.sock"
+TIMEOUT = 120  # max wait for queued + transcription
+
+
+def _send(req: dict, timeout: float = TIMEOUT) -> dict:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(str(SOCKET_PATH))
+    try:
+        sock.sendall(json.dumps(req).encode() + b"\n")
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.strip())
+    finally:
+        sock.close()
+
+
+def send_preload() -> dict:
+    return _send({"cmd": "preload"}, timeout=5)
+
+
+def send_transcribe(audio_path: str) -> dict:
+    return _send({"cmd": "transcribe", "audio_path": str(Path(audio_path).resolve())})
+
+
+def send_status() -> dict:
+    return _send({"cmd": "status"}, timeout=5)
+
+
+def send_unload() -> dict:
+    return _send({"cmd": "unload"}, timeout=10)
+
+
+def is_running() -> bool:
+    if not SOCKET_PATH.exists():
+        return False
+    try:
+        send_status()
+        return True
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: stt_client.py <preload|transcribe|status|unload> [audio_file]", file=sys.stderr)
+        sys.exit(2)
+
+    cmd = sys.argv[1]
+
+    try:
+        if cmd == "status":
+            resp = send_status()
+            pid = resp.get("pid", "?")
+            print(f"daemon running (pid {pid}), model: {resp.get('status', '?')}")
+
+        elif cmd == "preload":
+            resp = send_preload()
+            print(f"preload: {resp.get('status', resp)}")
+
+        elif cmd == "unload":
+            resp = send_unload()
+            print(f"unload: {resp.get('status', resp)}")
+
+        elif cmd == "transcribe":
+            if len(sys.argv) < 3:
+                print("usage: stt_client.py transcribe <audio_file>", file=sys.stderr)
+                sys.exit(2)
+            audio_path = sys.argv[2]
+            if not Path(audio_path).exists():
+                print(f"file not found: {audio_path}", file=sys.stderr)
+                sys.exit(1)
+            resp = send_transcribe(audio_path)
+            if "error" in resp:
+                print(f"error: {resp['error']}", file=sys.stderr)
+                sys.exit(1)
+            print(resp["text"])
+
+        else:
+            # backwards compat: bare audio path → transcribe
+            if Path(cmd).exists():
+                resp = send_transcribe(cmd)
+                if "error" in resp:
+                    print(f"error: {resp['error']}", file=sys.stderr)
+                    sys.exit(1)
+                print(resp["text"])
+            else:
+                print(f"unknown command: {cmd}", file=sys.stderr)
+                sys.exit(2)
+
+    except (ConnectionRefusedError, FileNotFoundError):
+        print("error: daemon not running — start with: ./stt_daemon.py", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
