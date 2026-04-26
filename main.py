@@ -28,7 +28,7 @@ FW_COMPUTE   = os.environ.get("FW_COMPUTE", "int8_float16")
 ATEMPO       = float(os.environ.get("ATEMPO", "1.5"))
 
 # ── model rotation ────────────────────────────────────────────────────────────
-BENCH_MODELS        = ["turbo"]
+BENCH_MODELS        = ["distil-large-v3"]
 BENCH_SAMPLES_EACH  = 30
 BENCH_STATE_FILE    = None  # set after OUTPUT_DIR is known
 
@@ -311,9 +311,7 @@ def main():
             _log(f"transcript: {stt_result[:60]}...")
             (TRANSCRIPT_DIR / f"raw_transcript_{timestamp}.txt").write_text(stt_result)
 
-            _log("formatting with GPT...")
-            formatted = format_text(stt_result, api_key)
-            _log(f"formatted: {formatted[:60]}...")
+            formatted = stt_result
 
             print(formatted)
             update_history(formatted)
