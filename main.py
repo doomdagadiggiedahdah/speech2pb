@@ -97,13 +97,15 @@ def _tick(label: str):
     _perf[label] = (now - _perf_t0).total_seconds()
     _perf_t0 = now
 
-def _log_perf_summary():
+def _log_perf_summary(audio_secs: float = 0, rtf: float = 0):
     total = sum(_perf.values())
     lines = ["--- perf summary ---"]
     for label, secs in _perf.items():
         bar = "#" * max(1, round(secs / max(_perf.values()) * 20))
         lines.append(f"  {secs:5.2f}s  {bar:<20}  {label}")
     lines.append(f"  {total:5.2f}s  total (excl. recording)")
+    if audio_secs:
+        lines.append(f"  audio: {audio_secs:.1f}s  rtf: {rtf:.2f}x  ({1/rtf:.1f}x realtime)")
     _log("\n".join(lines))
 
 # ── recording ─────────────────────────────────────────────────────────────────
@@ -333,10 +335,10 @@ def main():
     audio_secs = len(audio) / SAMPLE_RATE
     _log(f"recorded {audio_secs:.1f}s of audio")
 
-    # 6. Save original + apply atempo
-    save_m4a(audio, original_file)
-    _tick("save m4a")
+    # 6. Save original m4a in background (archive only — transcription doesn't need it)
+    threading.Thread(target=save_m4a, args=(audio, original_file), daemon=True).start()
 
+    # Apply atempo to produce the file whisper will read
     import soundfile as sf
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         sf.write(tmp.name, audio, SAMPLE_RATE)
@@ -377,7 +379,7 @@ def main():
                            input=formatted.encode(), check=True)
             _tick("clipboard + history")
 
-            _log_perf_summary()
+            _log_perf_summary(audio_secs=audio_secs, rtf=rtf)
 
             if not open_chat:
                 subprocess.run(["notify-send", "-t", "2000", "STT", formatted])
