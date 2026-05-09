@@ -28,7 +28,7 @@ FW_COMPUTE   = os.environ.get("FW_COMPUTE", "int8_float16")
 ATEMPO       = float(os.environ.get("ATEMPO", "1.5"))
 
 # ── model rotation ────────────────────────────────────────────────────────────
-BENCH_MODELS        = ["distil-large-v3"]
+BENCH_MODELS        = ["distil-large-v3.5"]
 BENCH_SAMPLES_EACH  = 30
 BENCH_STATE_FILE    = None  # set after OUTPUT_DIR is known
 
@@ -382,7 +382,10 @@ def main():
             _log_perf_summary(audio_secs=audio_secs, rtf=rtf)
 
             if not open_chat:
-                subprocess.run(["notify-send", "-t", "2000", "STT", formatted])
+                proc_secs = sum(_perf.values())
+                subprocess.run(["notify-send", "-t", "2000",
+                                f"STT — {proc_secs:.1f}s response : {audio_secs:.1f}s audio",
+                                formatted])
             else:
                 subprocess.Popen([sys.executable, str(SPOT / "stt_chat.py"), formatted])
             break  # success

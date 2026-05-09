@@ -62,6 +62,7 @@ _model_state = "idle"                # idle | loading | ready
 _state_lock = threading.Lock()
 _last_use = 0.0                      # monotonic timestamp of last transcription
 _idle_timer = None
+_load_gen = 0                        # bumped on timeout to invalidate hung loads
 
 def _set_state(s):
     global _model_state
@@ -72,43 +73,71 @@ def _get_state():
     with _state_lock:
         return _model_state
 
-def _do_load():
+def _do_load(gen):
     global _model
     _set_state("loading")
     _model_ready.clear()
     t0 = time.monotonic()
     try:
+        # wake GPU from power-save before ctranslate2 touches it
+        import torch
+        torch.cuda.synchronize()
         from faster_whisper import WhisperModel
-        _model = WhisperModel(FW_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE)
+        m = WhisperModel(FW_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE)
         elapsed = time.monotonic() - t0
+        if _load_gen != gen:
+            _log(f"model load finished but gen {gen} is stale (now {_load_gen}), discarding")
+            del m
+            return
+        _model = m
         _set_state("ready")
         _log(f"model loaded ({FW_MODEL}/{FW_DEVICE}/{FW_COMPUTE}) in {elapsed:.2f}s")
     except Exception as e:
+        if _load_gen != gen:
+            return
         _set_state("idle")
         _log(f"model load error: {e}")
     _model_ready.set()
 
+def _abandon_load():
+    """Invalidate a hung load so the next request retries fresh."""
+    global _load_gen
+    _load_gen += 1
+    _set_state("idle")
+    _model_ready.set()  # unblock any other waiters
+    _log(f"abandoned hung load, bumped gen to {_load_gen}")
+
 def start_preload():
     """Kick off model loading in a background thread if not already loaded/loading."""
+    global _last_use, _idle_timer
+    _last_use = time.monotonic()  # prevent idle timer from firing during load
+    if _idle_timer is not None:
+        _idle_timer.cancel()
+        _idle_timer = None
     state = _get_state()
     if state in ("loading", "ready"):
         return state
-    threading.Thread(target=_do_load, daemon=True).start()
+    gen = _load_gen
+    threading.Thread(target=_do_load, args=(gen,), daemon=True).start()
     return "loading"
 
-def unload_model():
+def _do_unload():
+    """Unload model. Caller must hold _model_lock."""
     global _model
-    with _model_lock:
-        _model = None
-        _model_ready.clear()
-        _set_state("idle")
-        gc.collect()
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+    _model = None
+    _model_ready.clear()
+    _set_state("idle")
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
     _log("model unloaded")
+
+def unload_model():
+    with _model_lock:
+        _do_unload()
 
 def _schedule_idle_unload():
     global _idle_timer
@@ -117,9 +146,22 @@ def _schedule_idle_unload():
     if IDLE_TIMEOUT <= 0:
         return
     def _check():
-        if _get_state() == "ready" and (time.monotonic() - _last_use) >= IDLE_TIMEOUT:
-            _log(f"idle for {IDLE_TIMEOUT}s, unloading model")
-            unload_model()
+        if _get_state() != "ready":
+            return
+        if (time.monotonic() - _last_use) < IDLE_TIMEOUT:
+            return
+        # try-acquire: if a transcription holds the lock, skip unload
+        if not _model_lock.acquire(blocking=False):
+            _log("idle timer fired but transcription in progress, skipping unload")
+            _schedule_idle_unload()  # reschedule
+            return
+        try:
+            # re-check after acquiring lock
+            if _get_state() == "ready" and (time.monotonic() - _last_use) >= IDLE_TIMEOUT:
+                _log(f"idle for {IDLE_TIMEOUT}s, unloading model")
+                _do_unload()
+        finally:
+            _model_lock.release()
     _idle_timer = threading.Timer(IDLE_TIMEOUT, _check)
     _idle_timer.daemon = True
     _idle_timer.start()
@@ -166,8 +208,14 @@ class RequestHandler(socketserver.StreamRequestHandler):
             _log(f"request queued: {audio_path}")
 
             with _model_lock:
-                # wait for model to finish loading
-                _model_ready.wait()
+                # wait for model — if it was unloaded while queued, reload
+                if not _model_ready.wait(timeout=60):
+                    _log("model load timed out after 60s — restarting daemon")
+                    self._respond(error="model load timed out")
+                    os._exit(1)  # systemd restarts us clean
+                if _get_state() != "ready":
+                    _log("model not ready after wait, reloading...")
+                    _do_load(_load_gen)
                 if _get_state() != "ready":
                     self._respond(error="model failed to load")
                     return
