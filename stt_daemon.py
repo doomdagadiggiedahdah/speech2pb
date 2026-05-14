@@ -15,23 +15,24 @@ Usage:
     ./stt_daemon.py --daemon     # daemonize (detach from terminal)
 
 Client protocol (one JSON line each way):
-    → {"cmd": "preload"}
-    ← {"status": "loading"}  or  {"status": "already_loaded"}
+    -> {"cmd": "preload"}
+    <- {"status": "loading"}  or  {"status": "already_loaded"}
 
-    → {"cmd": "transcribe", "audio_path": "/path/to/file.wav"}
-    ← {"text": "...", "elapsed": 1.23}
+    -> {"cmd": "transcribe", "audio_path": "/path/to/file.wav"}
+    <- {"text": "...", "elapsed": 1.23}
     or
-    ← {"error": "description"}
+    <- {"error": "description"}
 
-    → {"cmd": "status"}
-    ← {"status": "idle|loading|ready", "pid": 123}
+    -> {"cmd": "status"}
+    <- {"status": "idle|loading|ready", "pid": 123}
 
-    → {"cmd": "unload"}
-    ← {"status": "unloaded"}
+    -> {"cmd": "unload"}
+    <- {"status": "unloaded"}
 """
-import gc, json, os, socketserver, sys, threading, time
-from datetime import datetime
+import gc, json, logging, os, socketserver, sys, threading, time
 from pathlib import Path
+
+log = logging.getLogger("stt_daemon")
 
 SPOT        = Path(__file__).parent
 SOCKET_PATH = SPOT / ".output" / "stt.sock"
@@ -43,16 +44,6 @@ FW_DEVICE  = os.environ.get("FW_DEVICE", "cuda")
 FW_COMPUTE = os.environ.get("FW_COMPUTE", "int8_float16")
 
 IDLE_TIMEOUT = float(os.environ.get("STT_IDLE_TIMEOUT", "120"))  # seconds before auto-unload
-
-# ── logging ──────────────────────────────────────────────────────────────────
-_daemonized = False
-
-def _log(msg):
-    line = f"{datetime.now().isoformat(timespec='seconds')} {msg}"
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
-    if not _daemonized:
-        print(line, flush=True)
 
 # ── model lifecycle ──────────────────────────────────────────────────────────
 _model = None
@@ -86,17 +77,17 @@ def _do_load(gen):
         m = WhisperModel(FW_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE)
         elapsed = time.monotonic() - t0
         if _load_gen != gen:
-            _log(f"model load finished but gen {gen} is stale (now {_load_gen}), discarding")
+            log.warning("model load finished but gen %d is stale (now %d), discarding", gen, _load_gen)
             del m
             return
         _model = m
         _set_state("ready")
-        _log(f"model loaded ({FW_MODEL}/{FW_DEVICE}/{FW_COMPUTE}) in {elapsed:.2f}s")
+        log.info("model loaded (%s/%s/%s) in %.2fs", FW_MODEL, FW_DEVICE, FW_COMPUTE, elapsed)
     except Exception as e:
         if _load_gen != gen:
             return
         _set_state("idle")
-        _log(f"model load error: {e}")
+        log.error("model load error: %s", e)
     _model_ready.set()
 
 def _abandon_load():
@@ -105,7 +96,7 @@ def _abandon_load():
     _load_gen += 1
     _set_state("idle")
     _model_ready.set()  # unblock any other waiters
-    _log(f"abandoned hung load, bumped gen to {_load_gen}")
+    log.warning("abandoned hung load, bumped gen to %d", _load_gen)
 
 def start_preload():
     """Kick off model loading in a background thread if not already loaded/loading."""
@@ -133,7 +124,7 @@ def _do_unload():
         torch.cuda.empty_cache()
     except Exception:
         pass
-    _log("model unloaded")
+    log.info("model unloaded")
 
 def unload_model():
     with _model_lock:
@@ -152,13 +143,13 @@ def _schedule_idle_unload():
             return
         # try-acquire: if a transcription holds the lock, skip unload
         if not _model_lock.acquire(blocking=False):
-            _log("idle timer fired but transcription in progress, skipping unload")
+            log.debug("idle timer fired but transcription in progress, skipping unload")
             _schedule_idle_unload()  # reschedule
             return
         try:
             # re-check after acquiring lock
             if _get_state() == "ready" and (time.monotonic() - _last_use) >= IDLE_TIMEOUT:
-                _log(f"idle for {IDLE_TIMEOUT}s, unloading model")
+                log.info("idle for %.0fs, unloading model", IDLE_TIMEOUT)
                 _do_unload()
         finally:
             _model_lock.release()
@@ -205,38 +196,41 @@ class RequestHandler(socketserver.StreamRequestHandler):
 
             # ensure model is being loaded
             start_preload()
-            _log(f"request queued: {audio_path}")
+            log.info("request queued: %s", audio_path)
 
             with _model_lock:
                 # wait for model — if it was unloaded while queued, reload
                 if not _model_ready.wait(timeout=60):
-                    _log("model load timed out after 60s — restarting daemon")
+                    log.error("model load timed out after 60s — restarting daemon")
                     self._respond(error="model load timed out")
                     os._exit(1)  # systemd restarts us clean
                 if _get_state() != "ready":
-                    _log("model not ready after wait, reloading...")
+                    log.warning("model not ready after wait, reloading...")
                     _do_load(_load_gen)
                 if _get_state() != "ready":
                     self._respond(error="model failed to load")
                     return
-                _log(f"transcribing: {audio_path}")
+                log.info("transcribing: %s", audio_path)
                 t0 = time.monotonic()
                 try:
                     text = transcribe(audio_path)
                     elapsed = time.monotonic() - t0
                     _last_use = time.monotonic()
                     _schedule_idle_unload()
-                    _log(f"done in {elapsed:.2f}s: {text[:60]}...")
+                    log.info("done in %.2fs: %s...", elapsed, text[:60])
                     self._respond(text=text, elapsed=round(elapsed, 3))
                 except Exception as e:
-                    _log(f"transcribe error: {e}")
+                    log.error("transcribe error: %s", e)
                     self._respond(error=str(e))
         else:
             self._respond(error=f"unknown cmd: {cmd}")
 
     def _respond(self, **kwargs):
-        self.wfile.write(json.dumps(kwargs).encode() + b"\n")
-        self.wfile.flush()
+        try:
+            self.wfile.write(json.dumps(kwargs).encode() + b"\n")
+            self.wfile.flush()
+        except BrokenPipeError:
+            log.warning("client disconnected before response")
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
@@ -257,17 +251,33 @@ def daemonize():
     os.setsid()
     if os.fork() > 0:
         sys.exit(0)
-    sys.stdout = open(LOG_FILE, "a")
-    sys.stderr = sys.stdout
     sys.stdin = open(os.devnull)
+    sys.stdout = open(os.devnull, "w")
+    sys.stderr = open(LOG_FILE, "a")  # catch uncaught exceptions
 
 def main():
     SPOT_OUTPUT = SPOT / ".output"
     SPOT_OUTPUT.mkdir(exist_ok=True)
 
-    global _daemonized
-    if "--daemon" in sys.argv:
-        _daemonized = True
+    is_daemon = "--daemon" in sys.argv
+
+    # ── logging setup ─────────────────────────────────────────────────────────
+    log.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+    log.addHandler(file_handler)
+
+    if not is_daemon:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.DEBUG)
+        stream_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+        log.addHandler(stream_handler)
+
+    if is_daemon:
         daemonize()
 
     cleanup_socket()
@@ -275,11 +285,11 @@ def main():
 
     # No model loading here — daemon starts lightweight
     server = ThreadedUnixServer(str(SOCKET_PATH), RequestHandler)
-    _log(f"listening on {SOCKET_PATH} (pid {os.getpid()}) — model will load on first preload request")
+    log.info("listening on %s (pid %d) — model will load on first preload request", SOCKET_PATH, os.getpid())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        _log("shutting down")
+        log.info("shutting down")
     finally:
         server.shutdown()
         cleanup_socket()

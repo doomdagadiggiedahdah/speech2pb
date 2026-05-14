@@ -10,9 +10,11 @@ Flow:
   5. Wait for model (usually already done) → transcribe
   6. GPT-4.1-nano formatting → clipboard
 """
-import os, sys, threading, subprocess, tempfile, json, urllib.request
+import os, sys, threading, subprocess, tempfile, json, urllib.request, logging
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger("stt_hk")
 
 # ── config ────────────────────────────────────────────────────────────────────
 SPOT         = Path(__file__).parent
@@ -50,7 +52,6 @@ def _get_active_model() -> tuple[str, int]:
     BENCH_STATE_FILE.write_text(json.dumps(state))
     return model, state["total_runs"]
 SAMPLE_RATE  = 44100
-DEBUG        = "--debug" in sys.argv
 
 # ── credentials ───────────────────────────────────────────────────────────────
 def load_creds():
@@ -74,17 +75,11 @@ def _load_model():
     try:
         from faster_whisper import WhisperModel
         model = WhisperModel(FW_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE)
-        _log(f"model loaded ({FW_MODEL}/{FW_DEVICE}/{FW_COMPUTE}) in {(datetime.now()-t0).total_seconds():.2f}s")
+        log.info("model loaded (%s/%s/%s) in %.2fs", FW_MODEL, FW_DEVICE, FW_COMPUTE, (datetime.now()-t0).total_seconds())
     except Exception as e:
-        _log(f"model load error: {e}")
+        log.error("model load error: %s", e)
         _notify_error(f"model failed to load: {e}")
     model_ready.set()
-
-def _log(msg):
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
-    if DEBUG:
-        print(f"[debug] {msg}", file=sys.stderr)
 
 # ── perf timing ───────────────────────────────────────────────────────────────
 _perf: dict[str, float] = {}
@@ -106,7 +101,7 @@ def _log_perf_summary(audio_secs: float = 0, rtf: float = 0):
     lines.append(f"  {total:5.2f}s  total (excl. recording)")
     if audio_secs:
         lines.append(f"  audio: {audio_secs:.1f}s  rtf: {rtf:.2f}x  ({1/rtf:.1f}x realtime)")
-    _log("\n".join(lines))
+    log.info("\n".join(lines))
 
 # ── recording ─────────────────────────────────────────────────────────────────
 def record_until_stopped():
@@ -164,7 +159,7 @@ def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, floa
         result = "".join(lt.transcribe_stream(str(audio_path), model=model)).strip()
     elapsed = (datetime.now() - t0).total_seconds()
     rtf = elapsed / original_secs if original_secs > 0 else 0
-    _log(f"transcription done in {elapsed:.2f}s (audio: {original_secs:.1f}s, rtf: {rtf:.2f}x)")
+    log.info("transcription done in %.2fs (audio: %.1fs, rtf: %.2fx)", elapsed, original_secs, rtf)
     return result, elapsed, rtf
 
 # ── GPT formatting ────────────────────────────────────────────────────────────
@@ -210,7 +205,7 @@ def wait_dialog(proc: subprocess.Popen) -> int:
 
 # ── error handling ────────────────────────────────────────────────────────────
 def _notify_error(msg: str):
-    _log(f"ERROR: {msg}")
+    log.error(msg)
     subprocess.Popen(["notify-send", "-t", "8000", "-u", "critical", "stt_hk failed", msg])
 
 def _ask_retry() -> bool:
@@ -255,7 +250,7 @@ def ask_and_record_feedback(timestamp: str, model: str, audio_secs: float, rtf: 
     }
     with open(OUTPUT_DIR / "feedback.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
-    _log(f"feedback: {rating}/5 (model={model}, audio={audio_secs:.1f}s)")
+    log.info("feedback: %d/5 (model=%s, audio=%.1fs)", rating, model, audio_secs)
 
 
 def _maybe_remind_analysis(total_runs: int):
@@ -279,18 +274,33 @@ def _maybe_remind_analysis(total_runs: int):
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     global _perf_t0
+
+    # Ensure output dirs exist before logging setup
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    AUDIO_DIR.mkdir(exist_ok=True)
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+
+    # ── logging setup ─────────────────────────────────────────────────────────
+    debug = "--debug" in sys.argv
+    log.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+    log.addHandler(file_handler)
+
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setLevel(logging.DEBUG if debug else logging.WARNING)
+    stderr_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    log.addHandler(stderr_handler)
+
+    # ── start ─────────────────────────────────────────────────────────────────
     _perf_t0 = datetime.now()  # reset timer at true start
 
     # 1. Launch Zenity immediately — before any heavy work
     dialog_proc = launch_dialog()
-    _tick("startup → zenity shown")
-
-    creds = load_creds()
-    api_key = creds.get("OPENAI_API_KEY", "")
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    AUDIO_DIR.mkdir(exist_ok=True)
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    _tick("startup -> zenity shown")
 
     global BENCH_STATE_FILE, FW_MODEL
     BENCH_STATE_FILE = OUTPUT_DIR / "bench_state.json"
@@ -307,14 +317,14 @@ def main():
         use_daemon = True
         model_ready.set()  # no local waiting needed
         stt_client.send_preload()
-        _log("using stt_daemon — preload sent")
+        log.info("using stt_daemon — preload sent")
     else:
         model_load_start = datetime.now()
         threading.Thread(target=_load_model, daemon=True).start()
 
     # 3. Start recording
     stream, chunks, _ = record_until_stopped()
-    _log("recording started")
+    log.info("recording started")
 
     # 4. Wait for dialog — blocks until user clicks
     open_chat = wait_dialog(dialog_proc) != 0
@@ -322,7 +332,7 @@ def main():
     # 5. Stop recording
     stream.stop()
     stream.close()
-    _log("recording stopped")
+    log.info("recording stopped")
 
     if not chunks:
         print("No audio recorded.", file=sys.stderr)
@@ -333,7 +343,7 @@ def main():
     import numpy as np
     audio = np.concatenate(chunks)
     audio_secs = len(audio) / SAMPLE_RATE
-    _log(f"recorded {audio_secs:.1f}s of audio")
+    log.info("recorded %.1fs of audio", audio_secs)
 
     # 6. Save original m4a in background (archive only — transcription doesn't need it)
     threading.Thread(target=save_m4a, args=(audio, original_file), daemon=True).start()
@@ -345,7 +355,7 @@ def main():
         apply_atempo(Path(tmp.name), fast_file, ATEMPO)
         os.unlink(tmp.name)
     _tick("atempo")
-    _log(f"atempo {ATEMPO}x applied")
+    log.info("atempo %.1fx applied", ATEMPO)
 
     # Time how long we block waiting for the model (ideally 0 if recording was long enough)
     if not use_daemon:
@@ -355,19 +365,19 @@ def main():
         model_load_secs = (datetime.now() - model_load_start).total_seconds()
         _perf["model wait (blocked)"] = model_wait_secs
         _perf_t0 = datetime.now()
-        _log(f"model ready (total load {model_load_secs:.2f}s, blocked {model_wait_secs:.2f}s)")
+        log.info("model ready (total load %.2fs, blocked %.2fs)", model_load_secs, model_wait_secs)
     else:
         _perf_t0 = datetime.now()
 
     # 7–10. Transcribe → format → clipboard → notify (with retry on failure)
     for attempt in range(1, 4):
         try:
-            _log(f"transcribing (attempt {attempt})...")
+            log.info("transcribing (attempt %d)...", attempt)
             stt_result, transcribe_secs, rtf = transcribe(fast_file, audio_secs)
             _tick("whisper transcribe")
             if not stt_result:
                 raise RuntimeError("transcription returned empty result")
-            _log(f"transcript: {stt_result[:60]}...")
+            log.info("transcript: %s...", stt_result[:60])
             (TRANSCRIPT_DIR / f"raw_transcript_{timestamp}.txt").write_text(stt_result)
 
             formatted = stt_result
@@ -393,15 +403,14 @@ def main():
         except Exception as e:
             _notify_error(f"attempt {attempt}: {e}")
             if attempt == 3 or not _ask_retry():
-                _log("aborted after failure")
+                log.error("aborted after failure")
                 sys.exit(1)
 
     # 11. Feedback + milestone reminder (disabled)
     # ask_and_record_feedback(timestamp, FW_MODEL, audio_secs, rtf)
     # _maybe_remind_analysis(total_runs)
 
-    if DEBUG:
-        print(f"original: {original_file}", file=sys.stderr)
+    log.debug("original: %s", original_file)
 
 if __name__ == "__main__":
     main()
