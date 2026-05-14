@@ -13,17 +13,56 @@ Usage:
     .venv/bin/python nemotron_stream.py --chunk-ms 160   # larger chunks = lower CPU, same accuracy
     .venv/bin/python nemotron_stream.py --device cpu      # run on CPU
 
-Ctrl+C to stop.
+Ctrl+C to stop. Press Enter to finalize a block (copies cleaned text to clipboard).
 """
 import argparse
 import math
+import os
+import re
+import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
 import torch
 
 SAMPLE_RATE = 16000
+
+
+# ── text cleanup ──────────────────────────────────────────────────────────────
+
+# Filler words/phrases to strip (matched as whole words, case-insensitive)
+_FILLERS = [
+    r"\buh\b", r"\bum\b", r"\bumm\b", r"\buhh\b",
+    r"\boh\b(?!\s+(?:my|no|yes|god|wow|okay|man|well|really|great|right|dear|so|that|this|it|I|he|she|we|they|the|a))",
+    r"\bahh?\b", r"\bhmm\b", r"\bhuh\b",
+    r"\byeah\s+(?:um|uh)\b", r"\bokay\s+(?:so|and)\b",
+    r"\blike\b(?=\s*,?\s*(?:um|uh|I|you|we|they|he|she|it|the|a|this|that|so|but|and|if|when|what|how|why|where)\b)",
+]
+_FILLER_RE = re.compile("|".join(_FILLERS), re.IGNORECASE)
+
+
+def clean_transcript(text: str) -> str:
+    """Light cleanup: strip fillers, fix whitespace/punctuation."""
+    text = _FILLER_RE.sub("", text)
+    text = re.sub(r"\s*,\s*,+", ",", text)       # collapse repeated commas
+    text = re.sub(r"\s{2,}", " ", text)            # collapse whitespace
+    text = re.sub(r"\s+([.,!?])", r"\1", text)     # space before punctuation
+    text = re.sub(r"^\s*[.,]\s*", "", text)         # leading punctuation
+    return text.strip()
+
+
+def copy_to_clipboard(text: str):
+    """Copy text to X11 clipboard via xclip."""
+    try:
+        proc = subprocess.Popen(
+            ["xclip", "-selection", "clipboard"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(text.encode(), timeout=2)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print("[clipboard copy failed — is xclip installed?]", file=sys.stderr)
 
 
 def parse_args():
@@ -247,16 +286,70 @@ class StreamingTranscriber:
         return text
 
 
+def _finalize_block(text, prev_lines, cols):
+    """Finalize current transcript block: clean, print, copy to clipboard."""
+    cleaned = clean_transcript(text)
+    if not cleaned:
+        return
+
+    # Clear the live-updating text
+    if prev_lines > 1:
+        sys.stdout.write(f"\033[{prev_lines - 1}A")
+    sys.stdout.write(f"\r\033[J")
+
+    # Print the cleaned version as a permanent block
+    sys.stdout.write(f"{cleaned}\n\n")
+    sys.stdout.flush()
+
+    copy_to_clipboard(cleaned)
+    print(f"[copied {len(cleaned)} chars to clipboard]", file=sys.stderr, flush=True)
+
+
 def stream_from_mic(transcriber, chunk_ms, reset_mins):
-    """Stream from microphone, print partial transcripts."""
+    """Stream from microphone, print partial transcripts.
+
+    Press Enter to finalize a block (cleans fillers, copies to clipboard, resets).
+    Press Ctrl+C to stop.
+    """
+    import select
     import sounddevice as sd
+    import tty
+    import termios
 
     chunk_samples = int(SAMPLE_RATE * chunk_ms / 1000)
     reset_chunks = int(reset_mins * 60 * 1000 / chunk_ms) if reset_mins > 0 else 0
     chunks_since_reset = 0
 
     prev_text = ""
-    print(f"\nListening (chunk={chunk_ms}ms, reset every {reset_mins}min)...\n",
+    prev_lines = 0
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+
+    # Set terminal to raw mode so we can detect Enter without blocking
+    stdin_fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(stdin_fd)
+    enter_pressed = threading.Event()
+
+    def watch_keys():
+        """Background thread: detect Enter key in raw mode."""
+        try:
+            tty.setcbreak(stdin_fd)
+            while True:
+                if select.select([stdin_fd], [], [], 0.1)[0]:
+                    ch = os.read(stdin_fd, 1)
+                    if ch in (b'\n', b'\r'):
+                        enter_pressed.set()
+                    elif ch == b'\x03':  # Ctrl+C
+                        break
+        except (OSError, ValueError):
+            pass
+
+    key_thread = threading.Thread(target=watch_keys, daemon=True)
+    key_thread.start()
+
+    print(f"\nListening (chunk={chunk_ms}ms) — Enter to finalize block, Ctrl+C to stop\n",
           file=sys.stderr, flush=True)
 
     try:
@@ -266,28 +359,41 @@ def stream_from_mic(transcriber, chunk_ms, reset_mins):
                 audio, _ = stream.read(chunk_samples)
                 audio = audio.squeeze()
 
+                # Check for Enter
+                if enter_pressed.is_set():
+                    enter_pressed.clear()
+                    if prev_text.strip():
+                        _finalize_block(prev_text, prev_lines, cols)
+                    transcriber.reset()
+                    prev_text = ""
+                    prev_lines = 0
+                    chunks_since_reset = 0
+                    continue
+
                 text = transcriber.process_chunk(audio)
                 if text != prev_text:
-                    # Clear line and print updated transcript
-                    sys.stdout.write(f"\r\033[K{text}")
+                    if prev_lines > 1:
+                        sys.stdout.write(f"\033[{prev_lines - 1}A")
+                    sys.stdout.write(f"\r\033[J{text}")
                     sys.stdout.flush()
+                    prev_lines = max(1, (len(text) + cols - 1) // cols)
                     prev_text = text
 
                 chunks_since_reset += 1
                 if reset_chunks > 0 and chunks_since_reset >= reset_chunks:
-                    # Print final line, reset state
                     if prev_text.strip():
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        _finalize_block(prev_text, prev_lines, cols)
                     transcriber.reset()
                     prev_text = ""
+                    prev_lines = 0
                     chunks_since_reset = 0
-                    print("[state reset]", file=sys.stderr, flush=True)
 
     except KeyboardInterrupt:
         if prev_text.strip():
-            sys.stdout.write("\n")
+            _finalize_block(prev_text, prev_lines, cols)
         print("\nStopped.", file=sys.stderr, flush=True)
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
 
 
 def stream_from_file(transcriber, filepath, chunk_ms):
