@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date, timedelta
 
 import numpy as np
 import torch
@@ -65,21 +66,62 @@ def copy_to_clipboard(text: str):
         print("[clipboard copy failed — is xclip installed?]", file=sys.stderr)
 
 
+def _sunday_of_week(week_num: int, year: int) -> date:
+    """Return the Sunday starting ISO week `week_num`."""
+    jan4 = date(year, 1, 4)  # always in ISO week 1
+    monday_w1 = jan4 - timedelta(days=jan4.isoweekday() - 1)
+    monday = monday_w1 + timedelta(weeks=week_num - 1)
+    return monday - timedelta(days=1)  # Sunday before Monday
+
+
+def weeklist(raw: str | None = None) -> str:
+    """Generate a Sun-Sat markdown date list.
+
+    Accepts 'W20', 'W20 2026', '2026-05-10', or blank (= previous week).
+    """
+    year = date.today().year
+
+    if not raw or not raw.strip():
+        # Default: previous week
+        today = date.today()
+        # Current week's Sunday (Sun before or on today)
+        this_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+        sunday = this_sunday - timedelta(weeks=1)
+    elif raw.strip().upper().startswith("W"):
+        parts = raw.strip().split()
+        week_num = int(parts[0][1:])
+        if len(parts) > 1:
+            year = int(parts[1])
+        sunday = _sunday_of_week(week_num, year)
+    else:
+        d = date.fromisoformat(raw.strip())
+        sunday = d - timedelta(days=(d.weekday() + 1) % 7)
+
+    lines = [f"- ({(sunday + timedelta(days=i)).isoformat()})" for i in range(7)]
+    return "\n".join(lines)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Nemotron streaming STT")
     p.add_argument("--model", default="nvidia/nemotron-speech-streaming-en-0.6b")
     p.add_argument("--device", default="cuda", help="cuda or cpu")
-    p.add_argument("--chunk-ms", type=int, default=80, help="audio chunk size in ms (80-1040)")
-    p.add_argument("--reset-mins", type=float, default=10.0,
-                   help="reset decoder state every N minutes to prevent slowdown")
+    p.add_argument("--chunk-ms", type=int, default=640, help="audio chunk size in ms (80-1040)")
     p.add_argument("--file", type=str, default=None,
                    help="transcribe a file instead of live mic (for testing)")
+    p.add_argument("--weeklist", nargs="?", const="", default=None, metavar="WEEK",
+                   help="print week date list and exit (e.g. W20, 2026-05-10, or blank for prev week)")
+    p.add_argument("--verbose", action="store_true", help="show NeMo startup logs")
     return p.parse_args()
 
 
-def load_model(model_name, device):
+def load_model(model_name, device, verbose=False):
+    import logging as _logging
+
     print(f"Loading {model_name}...", file=sys.stderr, flush=True)
     t0 = time.monotonic()
+
+    if not verbose:
+        _logging.disable(_logging.WARNING)
 
     import nemo.collections.asr as nemo_asr
     from omegaconf import open_dict
@@ -88,6 +130,12 @@ def load_model(model_name, device):
     model = nemo_asr.models.ASRModel.from_pretrained(
         model_name, map_location="cpu"
     )
+
+    if not verbose:
+        _logging.disable(_logging.INFO)
+    else:
+        _logging.disable(_logging.NOTSET)
+
     model = model.half().to(device)
     model.eval()
 
@@ -104,6 +152,8 @@ def load_model(model_name, device):
             if hasattr(decoding_cfg.greedy, 'use_cuda_graph_decoder'):
                 decoding_cfg.greedy.use_cuda_graph_decoder = False
     model.change_decoding_strategy(decoding_cfg)
+
+    _logging.disable(_logging.NOTSET)
 
     elapsed = time.monotonic() - t0
     print(f"Model loaded in {elapsed:.1f}s", file=sys.stderr, flush=True)
@@ -305,7 +355,7 @@ def _finalize_block(text, prev_lines, cols):
     print(f"[copied {len(cleaned)} chars to clipboard]", file=sys.stderr, flush=True)
 
 
-def stream_from_mic(transcriber, chunk_ms, reset_mins):
+def stream_from_mic(transcriber, chunk_ms):
     """Stream from microphone, print partial transcripts.
 
     Press Enter to finalize a block (cleans fillers, copies to clipboard, resets).
@@ -317,8 +367,6 @@ def stream_from_mic(transcriber, chunk_ms, reset_mins):
     import termios
 
     chunk_samples = int(SAMPLE_RATE * chunk_ms / 1000)
-    reset_chunks = int(reset_mins * 60 * 1000 / chunk_ms) if reset_mins > 0 else 0
-    chunks_since_reset = 0
 
     prev_text = ""
     prev_lines = 0
@@ -367,7 +415,6 @@ def stream_from_mic(transcriber, chunk_ms, reset_mins):
                     transcriber.reset()
                     prev_text = ""
                     prev_lines = 0
-                    chunks_since_reset = 0
                     continue
 
                 text = transcriber.process_chunk(audio)
@@ -378,15 +425,6 @@ def stream_from_mic(transcriber, chunk_ms, reset_mins):
                     sys.stdout.flush()
                     prev_lines = max(1, (len(text) + cols - 1) // cols)
                     prev_text = text
-
-                chunks_since_reset += 1
-                if reset_chunks > 0 and chunks_since_reset >= reset_chunks:
-                    if prev_text.strip():
-                        _finalize_block(prev_text, prev_lines, cols)
-                    transcriber.reset()
-                    prev_text = ""
-                    prev_lines = 0
-                    chunks_since_reset = 0
 
     except KeyboardInterrupt:
         if prev_text.strip():
@@ -451,7 +489,15 @@ def stream_from_file(transcriber, filepath, chunk_ms):
 
 def main():
     args = parse_args()
-    model = load_model(args.model, args.device)
+
+    if args.weeklist is not None:
+        raw = args.weeklist if args.weeklist else None
+        result = weeklist(raw)
+        print(result)
+        copy_to_clipboard(result)
+        return
+
+    model = load_model(args.model, args.device, verbose=args.verbose)
     transcriber = StreamingTranscriber(
         model,
         chunk_size_in_secs=args.chunk_ms / 1000.0,
@@ -461,7 +507,7 @@ def main():
     if args.file:
         stream_from_file(transcriber, args.file, args.chunk_ms)
     else:
-        stream_from_mic(transcriber, args.chunk_ms, args.reset_mins)
+        stream_from_mic(transcriber, args.chunk_ms)
 
 
 if __name__ == "__main__":
