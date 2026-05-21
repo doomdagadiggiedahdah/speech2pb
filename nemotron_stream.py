@@ -116,42 +116,43 @@ def parse_args():
 
 def load_model(model_name, device, verbose=False):
     import logging as _logging
+    from loading_anim import LoadingAnimation
 
-    print(f"Loading {model_name}...", file=sys.stderr, flush=True)
     t0 = time.monotonic()
 
     if not verbose:
         _logging.disable(_logging.WARNING)
 
-    import nemo.collections.asr as nemo_asr
-    from omegaconf import open_dict
+    with LoadingAnimation("Loading model"):
+        import nemo.collections.asr as nemo_asr
+        from omegaconf import open_dict
 
-    # Load to CPU first in float32, then half() to fit in 4GB VRAM
-    model = nemo_asr.models.ASRModel.from_pretrained(
-        model_name, map_location="cpu"
-    )
+        # Load to CPU first in float32, then half() to fit in 4GB VRAM
+        model = nemo_asr.models.ASRModel.from_pretrained(
+            model_name, map_location="cpu"
+        )
 
-    if not verbose:
-        _logging.disable(_logging.INFO)
-    else:
-        _logging.disable(_logging.NOTSET)
+        if not verbose:
+            _logging.disable(_logging.INFO)
+        else:
+            _logging.disable(_logging.NOTSET)
 
-    model = model.half().to(device)
-    model.eval()
+        model = model.half().to(device)
+        model.eval()
 
-    # Configure greedy decoding
-    decoding_cfg = model.cfg.decoding
-    with open_dict(decoding_cfg):
-        decoding_cfg.strategy = "greedy"
-        decoding_cfg.compute_timestamps = False
-        decoding_cfg.preserve_alignments = False
-        if hasattr(model, 'joint'):
-            decoding_cfg.greedy.max_symbols = 10
-            decoding_cfg.fused_batch_size = -1
-            # Disable CUDA graph decoder — known to crash on some GPUs
-            if hasattr(decoding_cfg.greedy, 'use_cuda_graph_decoder'):
-                decoding_cfg.greedy.use_cuda_graph_decoder = False
-    model.change_decoding_strategy(decoding_cfg)
+        # Configure greedy decoding
+        decoding_cfg = model.cfg.decoding
+        with open_dict(decoding_cfg):
+            decoding_cfg.strategy = "greedy"
+            decoding_cfg.compute_timestamps = False
+            decoding_cfg.preserve_alignments = False
+            if hasattr(model, 'joint'):
+                decoding_cfg.greedy.max_symbols = 10
+                decoding_cfg.fused_batch_size = -1
+                # Disable CUDA graph decoder — known to crash on some GPUs
+                if hasattr(decoding_cfg.greedy, 'use_cuda_graph_decoder'):
+                    decoding_cfg.greedy.use_cuda_graph_decoder = False
+        model.change_decoding_strategy(decoding_cfg)
 
     _logging.disable(_logging.NOTSET)
 
