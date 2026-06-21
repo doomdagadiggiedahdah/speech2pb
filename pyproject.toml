@@ -9,6 +9,7 @@ dependencies = [
     "soundfile>=0.12",
     "librosa>=0.10",
     "sounddevice==0.5.5",
+    "textual>=0.80",
 ]
 
 [tool.uv.sources]
