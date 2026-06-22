@@ -245,31 +245,25 @@ class DictationApp(App):
         """Enter key: commit pending, clean it, copy to clipboard, reset ASR."""
         seg = self.raw_buffer.commit_pending()
         if seg:
+            # Reset immediately (sync) so ASR loop doesn't render stale text
+            self._reset_event.set()
+            self.raw_buffer.segments.clear()
+            self.query_one(RawPane).clear()
+            # Process cleanup, copy, save in background
             asyncio.create_task(self._commit_and_copy(seg))
         else:
             self.notify("Nothing to commit")
 
     async def _commit_and_copy(self, segment: Segment):
-        """Process segment, copy cleaned text, signal ASR reset."""
+        """Process segment, copy cleaned text, save transcript."""
         await self._process_segment(segment)
 
-        # Copy the just-committed segment's cleaned text
         cleaned = segment.cleaned or segment.text
         _copy_to_clipboard(cleaned)
         self.notify(f"Copied {len(cleaned)} chars")
 
-        # Save transcript
         from nemotron_stream import save_transcript
         save_transcript(cleaned)
-
-        # Reset ASR decoder for fresh start
-        self._reset_event.set()
-
-        # Refresh raw pane
-        raw_pane = self.query_one(RawPane)
-        raw_pane.clear()
-        for seg in self.raw_buffer.segments:
-            raw_pane.write(f"[bold]{seg.text}[/bold]")
 
     def action_show_help(self):
         self.push_screen(HelpScreen())
