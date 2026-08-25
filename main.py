@@ -10,7 +10,7 @@ Flow:
   5. Wait for model (usually already done) → transcribe
   6. GPT-4.1-nano formatting → clipboard
 """
-import os, sys, threading, subprocess, tempfile, json, urllib.request, logging
+import os, sys, threading, subprocess, tempfile, json, traceback, urllib.request, logging
 from datetime import datetime
 from pathlib import Path
 
@@ -208,6 +208,79 @@ def _notify_error(msg: str):
     log.error(msg)
     subprocess.Popen(["notify-send", "-t", "8000", "-u", "critical", "stt_hk failed", msg])
 
+
+def _run_diagnostic(error_msg: str):
+    """Write a crash-context report to .output/diagnostics/ for later reading."""
+    try:
+        # Collect context
+        gpu_info = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,temperature.gpu,utilization.gpu",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or "(unavailable)"
+
+        daemon_log = ""
+        daemon_log_path = OUTPUT_DIR / "stt_daemon.log"
+        if daemon_log_path.exists():
+            daemon_log = daemon_log_path.read_text().splitlines()[-30:]
+            daemon_log = "\n".join(daemon_log)
+
+        preload_log = ""
+        if LOG_FILE.exists():
+            preload_log = LOG_FILE.read_text().splitlines()[-30:]
+            preload_log = "\n".join(preload_log)
+
+        dmesg = subprocess.run(
+            ["dmesg", "--time-format", "iso"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()[-10:]
+        dmesg = "\n".join(dmesg)
+
+        report = f"""# stt_hk crash report — {datetime.now():%Y-%m-%d %H:%M:%S}
+
+## Error
+```
+{error_msg}
+```
+
+## GPU state
+```
+{gpu_info}
+```
+
+## Application log (last 30 lines)
+```
+{preload_log}
+```
+
+## Daemon log (last 30 lines)
+```
+{daemon_log}
+```
+
+## dmesg (last 10 lines)
+```
+{dmesg}
+```
+
+## Key facts
+- GPU: Quadro T1000 Max-Q, 4GB VRAM
+- Model: faster-whisper {FW_MODEL} ({FW_DEVICE}/{FW_COMPUTE})
+- Daemon active: {use_daemon}
+- Project dir: {SPOT}
+"""
+
+        diag_dir = OUTPUT_DIR / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        path = diag_dir / f"diagnostic_{datetime.now():%Y%m%d_%H%M%S}.md"
+        path.write_text(report)
+
+        subprocess.Popen(["notify-send", "-t", "5000", "-u", "normal",
+                          "stt_hk", f"Crash report saved: {path.name}"])
+        log.info("diagnostic report written: %s", path)
+    except Exception as e:
+        log.warning("failed to write diagnostic report: %s", e)
+
 def _ask_retry() -> bool:
     result = subprocess.run([
         "zenity", "--question",
@@ -404,6 +477,7 @@ def main():
             _notify_error(f"attempt {attempt}: {e}")
             if attempt == 3 or not _ask_retry():
                 log.error("aborted after failure")
+                _run_diagnostic(f"attempt {attempt}: {e}\n\n{traceback.format_exc()}")
                 sys.exit(1)
 
     # 11. Feedback + milestone reminder (disabled)
