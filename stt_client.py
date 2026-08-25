@@ -8,11 +8,17 @@ Usage:
     ./stt_client.py status                 # check daemon state
     ./stt_client.py unload                 # free GPU memory
 """
-import json, socket, sys
+import contextlib, json, socket, sys, wave
 from pathlib import Path
 
 SOCKET_PATH = Path(__file__).parent / ".output" / "stt.sock"
-TIMEOUT = 120  # max wait for queued + transcription
+TIMEOUT = 120  # floor, for short clips and non-transcribe commands
+
+# Transcription time scales with audio length (~0.3-0.4x RTF observed), so a fixed
+# ceiling silently truncates long recordings: the daemon finishes, finds the client
+# gone, and throws the transcript away. Budget 2x realtime plus slack for queueing.
+RTF_BUDGET = 2.0
+QUEUE_SLACK = 60.0
 
 
 def _send(req: dict, timeout: float = TIMEOUT) -> dict:
@@ -36,8 +42,22 @@ def send_preload() -> dict:
     return _send({"cmd": "preload"}, timeout=5)
 
 
+def _audio_secs(audio_path: str) -> float:
+    """Duration of a wav, or 0.0 if it can't be read (caller falls back to TIMEOUT)."""
+    with contextlib.suppress(Exception):
+        with wave.open(str(audio_path), "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    return 0.0
+
+
+def _transcribe_timeout(audio_path: str) -> float:
+    return max(TIMEOUT, _audio_secs(audio_path) * RTF_BUDGET + QUEUE_SLACK)
+
+
 def send_transcribe(audio_path: str) -> dict:
-    return _send({"cmd": "transcribe", "audio_path": str(Path(audio_path).resolve())})
+    path = str(Path(audio_path).resolve())
+    return _send({"cmd": "transcribe", "audio_path": path},
+                 timeout=_transcribe_timeout(path))
 
 
 def send_status() -> dict:

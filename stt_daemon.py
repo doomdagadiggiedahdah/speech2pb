@@ -55,6 +55,15 @@ _last_use = 0.0                      # monotonic timestamp of last transcription
 _idle_timer = None
 _load_gen = 0                        # bumped on timeout to invalidate hung loads
 
+# Last completed transcription, so a client that timed out and retried gets the
+# result it already paid for instead of re-running the whole job.
+_last_result = None                  # (key, text, elapsed) or None
+_result_lock = threading.Lock()
+
+def _cache_key(audio_path: str):
+    st = os.stat(audio_path)
+    return (os.path.realpath(audio_path), st.st_mtime_ns, st.st_size)
+
 def _set_state(s):
     global _model_state
     with _state_lock:
@@ -164,7 +173,7 @@ def transcribe(audio_path: str) -> str:
 # ── socket server ────────────────────────────────────────────────────────────
 class RequestHandler(socketserver.StreamRequestHandler):
     def handle(self):
-        global _last_use
+        global _last_use, _last_result
         raw = self.rfile.readline()
         if not raw:
             return
@@ -194,6 +203,17 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 self._respond(error=f"file not found: {audio_path}")
                 return
 
+            # Serve a repeat request for the same file from cache. Checked before
+            # taking _model_lock so a retry answers immediately even while another
+            # transcription holds the lock.
+            key = _cache_key(audio_path)
+            with _result_lock:
+                cached = _last_result
+            if cached and cached[0] == key:
+                log.info("cache hit: %s", audio_path)
+                self._respond(text=cached[1], elapsed=cached[2], cached=True)
+                return
+
             # ensure model is being loaded
             start_preload()
             log.info("request queued: %s", audio_path)
@@ -214,11 +234,13 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 t0 = time.monotonic()
                 try:
                     text = transcribe(audio_path)
-                    elapsed = time.monotonic() - t0
+                    elapsed = round(time.monotonic() - t0, 3)
                     _last_use = time.monotonic()
                     _schedule_idle_unload()
                     log.info("done in %.2fs: %s...", elapsed, text[:60])
-                    self._respond(text=text, elapsed=round(elapsed, 3))
+                    with _result_lock:
+                        _last_result = (key, text, elapsed)
+                    self._respond(text=text, elapsed=elapsed)
                 except Exception as e:
                     log.error("transcribe error: %s", e)
                     self._respond(error=str(e))
