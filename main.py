@@ -3,12 +3,12 @@
 stt_hk main — drop-in Python replacement for main.sh.
 
 Flow:
-  1. Zenity dialog shown immediately (Copy / Chat)
-  2. Model loads in background thread
-  3. Recording starts
-  4. User stops → audio saved, atempo applied
+  1. xmessage "Starting..." dialog shown immediately
+  2. Model loads in background thread (or daemon preload)
+  3. Recording starts → dialog swapped in place for red "Recording"
+  4. User clicks Stop or presses Enter → audio saved, atempo applied
   5. Wait for model (usually already done) → transcribe
-  6. GPT-4.1-nano formatting → clipboard
+  6. Clipboard + notification
 """
 import os, sys, threading, subprocess, tempfile, json, traceback, urllib.request, logging
 from datetime import datetime
@@ -104,19 +104,51 @@ def _log_perf_summary(audio_secs: float = 0, rtf: float = 0):
     log.info("\n".join(lines))
 
 # ── recording ─────────────────────────────────────────────────────────────────
-def record_until_stopped():
-    """Returns numpy float32 mono audio array recorded until stop_event is set."""
-    import sounddevice as sd
-    chunks = []
-    stop = threading.Event()
+class Recorder:
+    """Mic capture that starts as fast as possible.
 
-    def callback(indata, frames, time, status):
-        chunks.append(indata[:, 0].copy())
+    Primary: `pw-record` subprocess piping raw float32 (~0.08s to first audio,
+    no Python imports). Fallback: sounddevice/PortAudio (~0.3s import + ~0.3s open).
+    Call stop() to get the audio as a numpy float32 mono array."""
 
-    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                            dtype="float32", callback=callback)
-    stream.start()
-    return stream, chunks, stop
+    def __init__(self):
+        self._chunks: list = []
+        self._proc = None
+        self._stream = None
+        try:
+            self._proc = subprocess.Popen(
+                ["pw-record", "--rate", str(SAMPLE_RATE), "--channels", "1",
+                 "--format", "f32", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._reader = threading.Thread(target=self._read_pipe, daemon=True)
+            self._reader.start()
+            self.backend = "pw-record"
+        except FileNotFoundError:
+            self._start_sounddevice()
+            self.backend = "sounddevice"
+
+    def _read_pipe(self):
+        for block in iter(lambda: self._proc.stdout.read(SAMPLE_RATE // 10 * 4), b""):
+            self._chunks.append(block)
+
+    def _start_sounddevice(self):
+        import sounddevice as sd
+        def callback(indata, frames, time, status):
+            self._chunks.append(indata[:, 0].tobytes())
+        self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                                      dtype="float32", callback=callback)
+        self._stream.start()
+
+    def stop(self):
+        import numpy as np
+        if self._proc is not None:
+            self._proc.terminate()
+            self._reader.join(timeout=2)
+            self._proc.wait(timeout=2)
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+        return np.frombuffer(b"".join(self._chunks), dtype=np.float32)
 
 # ── audio processing ──────────────────────────────────────────────────────────
 def apply_atempo(input_path: Path, output_path: Path, rate: float):
@@ -188,20 +220,89 @@ def format_text(text: str, api_key: str) -> str:
         data = json.loads(resp.read())
     return data["choices"][0]["message"]["content"].strip()
 
-# ── zenity dialog ─────────────────────────────────────────────────────────────
-def launch_dialog() -> subprocess.Popen:
-    """Launch the Zenity dialog in the background; call wait_dialog() to get result."""
-    return subprocess.Popen([
-        "zenity", "--question",
-        "--title=stt_hk", "--text=Recording...",
-        "--ok-label=Copy", "--cancel-label=Chat",
-        "--width=200", "--height=80",
-    ])
+# ── recording dialog ──────────────────────────────────────────────────────────
+# xmessage (Xaw, no GTK) maps a window in ~0.3s vs ~1s for zenity 4 / GTK4.
+# Its text can't change after launch, so the state is shown in two stages:
+# a gray "Starting..." window immediately, swapped in place for a red "Recording"
+# window once the mic stream is actually live.
+XMESSAGE_STYLE = [
+    "-xrm", "*font: -*-dejavu sans-medium-r-normal-*-14-*-*-*-*-*-*-*",
+    "-xrm", "*Command.font: -*-dejavu sans-bold-r-normal-*-12-*-*-*-*-*-*-*",
+    "-xrm", "*borderWidth: 0",
+    "-xrm", "*background: #2e3436", "-xrm", "*foreground: #eeeeec",
+    "-xrm", "*Command.background: #3d4245", "-xrm", "*Command.foreground: #eeeeec",
+    "-xrm", "*Command.internalWidth: 14", "-xrm", "*Command.internalHeight: 4",
+    "-xrm", "*message.scrollVertical: never", "-xrm", "*message.scrollHorizontal: never",
+    "-xrm", "*message.displayCaret: false",
+    "-xrm", "*message.leftMargin: 12", "-xrm", "*message.rightMargin: 12",
+    "-xrm", "*message.topMargin: 6", "-xrm", "*message.bottomMargin: 2",
+    "-xrm", "*message*background: #2e3436",
+]
+DIALOG_STARTING  = ("Starting...  ", "#888a85")
+DIALOG_RECORDING = ("Recording    ", "#f25c5c")
 
-def wait_dialog(proc: subprocess.Popen) -> int:
-    """Returns 0 for Copy, 1 for Chat."""
-    proc.wait()
-    return proc.returncode
+_dialog_seq = 0
+
+def launch_dialog(text: str, color: str, buttons: str = "Stop:0") -> subprocess.Popen:
+    """Launch an xmessage window in the background. xmessage (Xt) doesn't set
+    _NET_WM_PID, so each window gets a unique title we can find it by later."""
+    global _dialog_seq
+    _dialog_seq += 1
+    title = f"stt_hk:{os.getpid()}:{_dialog_seq}"
+    default = buttons.split(":")[0]
+    proc = subprocess.Popen(
+        ["xmessage", "-center", "-title", title,
+         "-buttons", buttons, "-default", default,
+         *XMESSAGE_STYLE, "-xrm", f"*message*foreground: {color}", text],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proc.window_title = title
+    return proc
+
+def _find_dialog_window(proc: subprocess.Popen, timeout: float = 3.0):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline and proc.poll() is None:
+        out = subprocess.run(["xdotool", "search", "--name", f"^{proc.window_title}$"],
+                             capture_output=True, text=True).stdout.split()
+        if out:
+            return out[-1]
+        time.sleep(0.01)
+    return None
+
+def _style_dialog_window(proc: subprocess.Popen, replace: subprocess.Popen | None = None):
+    """Once the dialog maps, strip its title bar and pin it above other windows,
+    then kill the window it replaces (if any). Runs in a thread so it never delays
+    recording. Best-effort: any failure just leaves a normal decorated window."""
+    wid = _find_dialog_window(proc)
+    quiet = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if wid:
+        # _MOTIF_WM_HINTS flags=2 (decorations), decorations=0 -> no title bar / frame
+        subprocess.run(["xprop", "-id", wid, "-f", "_MOTIF_WM_HINTS", "32c",
+                        "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"], **quiet)
+        subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,above"], **quiet)
+    if replace is not None and replace.poll() is None:
+        # Hand keyboard focus over only if the old window had it, so Enter still
+        # stops recording but we don't steal focus from wherever the user went.
+        old_wid = _find_dialog_window(replace, timeout=0.5)
+        active = subprocess.run(["xdotool", "getactivewindow"],
+                                capture_output=True, text=True).stdout.strip()
+        if wid and old_wid and active == old_wid:
+            subprocess.run(["xdotool", "windowactivate", "--sync", wid], **quiet)
+        replace.terminate()
+
+def wait_dialogs(*procs: subprocess.Popen):
+    """Block until the user clicks Stop / presses Enter on any of the dialogs.
+    A dialog we terminated ourselves (negative return code) doesn't count."""
+    import time
+    while True:
+        for p in procs:
+            if p.poll() is not None and p.returncode >= 0:
+                for other in procs:
+                    if other.poll() is None:
+                        other.terminate()
+                return
+        time.sleep(0.02)
 
 # ── error handling ────────────────────────────────────────────────────────────
 def _notify_error(msg: str):
@@ -282,13 +383,9 @@ def _run_diagnostic(error_msg: str):
         log.warning("failed to write diagnostic report: %s", e)
 
 def _ask_retry() -> bool:
-    result = subprocess.run([
-        "zenity", "--question",
-        "--title=stt_hk", "--text=Pipeline failed. Retry?",
-        "--ok-label=Retry", "--cancel-label=Abort",
-        "--width=220", "--height=80",
-    ], capture_output=True)
-    return result.returncode == 0
+    proc = launch_dialog("Pipeline failed. Retry?    ", "#eeeeec", buttons="Retry:0,Abort:1")
+    threading.Thread(target=_style_dialog_window, args=(proc,), daemon=True).start()
+    return proc.wait() == 0
 
 # ── history ───────────────────────────────────────────────────────────────────
 def update_history(text: str):
@@ -371,9 +468,10 @@ def main():
     # ── start ─────────────────────────────────────────────────────────────────
     _perf_t0 = datetime.now()  # reset timer at true start
 
-    # 1. Launch Zenity immediately — before any heavy work
-    dialog_proc = launch_dialog()
-    _tick("startup -> zenity shown")
+    # 1. Launch the "Starting..." dialog immediately — before any heavy work
+    starting_proc = launch_dialog(*DIALOG_STARTING)
+    threading.Thread(target=_style_dialog_window, args=(starting_proc,), daemon=True).start()
+    _tick("startup -> dialog spawned")
 
     global BENCH_STATE_FILE, FW_MODEL
     BENCH_STATE_FILE = OUTPUT_DIR / "bench_state.json"
@@ -395,26 +493,26 @@ def main():
         model_load_start = datetime.now()
         threading.Thread(target=_load_model, daemon=True).start()
 
-    # 3. Start recording
-    stream, chunks, _ = record_until_stopped()
-    log.info("recording started")
+    # 3. Start recording, then swap the dialog to "Recording" once the mic is live
+    recorder = Recorder()
+    log.info("recording started (%s)", recorder.backend)
+    recording_proc = launch_dialog(*DIALOG_RECORDING)
+    threading.Thread(target=_style_dialog_window,
+                     args=(recording_proc, starting_proc), daemon=True).start()
 
-    # 4. Wait for dialog — blocks until user clicks
-    open_chat = wait_dialog(dialog_proc) != 0
+    # 4. Block until user clicks Stop / presses Enter on either window
+    wait_dialogs(starting_proc, recording_proc)
 
     # 5. Stop recording
-    stream.stop()
-    stream.close()
+    audio = recorder.stop()
     log.info("recording stopped")
 
-    if not chunks:
+    if len(audio) == 0:
         print("No audio recorded.", file=sys.stderr)
         sys.exit(1)
 
     _perf_t0 = datetime.now()  # start timing post-recording work from here
 
-    import numpy as np
-    audio = np.concatenate(chunks)
     audio_secs = len(audio) / SAMPLE_RATE
     log.info("recorded %.1fs of audio", audio_secs)
 
@@ -464,13 +562,10 @@ def main():
 
             _log_perf_summary(audio_secs=audio_secs, rtf=rtf)
 
-            if not open_chat:
-                proc_secs = sum(_perf.values())
-                subprocess.run(["notify-send", "-t", "2000",
-                                f"STT — {proc_secs:.1f}s response : {audio_secs:.1f}s audio",
-                                formatted])
-            else:
-                subprocess.Popen([sys.executable, str(SPOT / "stt_chat.py"), formatted])
+            proc_secs = sum(_perf.values())
+            subprocess.run(["notify-send", "-t", "2000",
+                            f"STT — {proc_secs:.1f}s response : {audio_secs:.1f}s audio",
+                            formatted])
             break  # success
 
         except Exception as e:
