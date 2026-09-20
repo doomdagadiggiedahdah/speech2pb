@@ -173,13 +173,13 @@ def _draw_wait_curve(runs, fit, current, path: Path):
 def _notify_result(audio_secs: float, wait_secs: float, text: str):
     runs = _pipeline_runs()
     fit = _fit_wait_curve(runs)
-    rows = [f"transcribed in {wait_secs:.1f}s · {audio_secs / wait_secs:.1f}× realtime"]
+    rows = [f"L={audio_secs:.1f}s  RT={audio_secs / wait_secs:.1f}×"]
     if fit:
         expected = fit[0] + fit[1] * audio_secs
-        rows.append(f"curve {fit[0]:.1f}s + {fit[1]:.2f}s per s (n={len(runs)})")
-        rows.append(f"expected {expected:.1f}s · this run {wait_secs - expected:+.1f}s")
+        rows.append(f"t={wait_secs:.1f}s  E[t]={expected:.1f}s  Δ={wait_secs - expected:+.1f}s")
+        rows.append(f"E[t]={fit[0]:.1f}+{fit[1]:.2f}·L  n={len(runs)}")
     else:
-        rows.append(f"curve: {max(0, CURVE_MIN_RUNS - len(runs))} more runs needed")
+        rows.append(f"t={wait_secs:.1f}s  E[t]: n={len(runs)}/{CURVE_MIN_RUNS}")
     cmd = ["notify-send", "-t", "2000"]
     try:
         curve_png = OUTPUT_DIR / "wait_curve.png"
@@ -187,7 +187,7 @@ def _notify_result(audio_secs: float, wait_secs: float, text: str):
         cmd += ["-i", str(curve_png)]
     except Exception as e:
         log.debug("wait curve not drawn: %s", e)
-    subprocess.run(cmd + [f"STT · {audio_secs:.1f}s audio", "\n".join(rows) + "\n" + text])
+    subprocess.run(cmd + ["STT", "\n".join(rows)])
 
 # ── recording ─────────────────────────────────────────────────────────────────
 class Recorder:
