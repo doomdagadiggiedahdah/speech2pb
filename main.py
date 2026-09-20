@@ -121,6 +121,19 @@ def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float):
     with open(OUTPUT_DIR / "runs.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
 
+SPEED_WINDOW = 50  # runs pooled for the rolling average shown in the notification
+
+def _rolling_speed(window: int = SPEED_WINDOW) -> tuple[float, int]:
+    """(speed, n) over the last `window` runs of the current PIPELINE, where speed is
+    total audio / total wait — pooled, so short recordings don't dominate the average."""
+    try:
+        runs = [json.loads(l) for l in (OUTPUT_DIR / "runs.jsonl").read_text().splitlines()]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0.0, 0
+    runs = [r for r in runs if r.get("pipeline") == PIPELINE][-window:]
+    wait = sum(r["wait_secs"] for r in runs)
+    return (sum(r["audio_secs"] for r in runs) / wait if wait else 0.0), len(runs)
+
 # ── recording ─────────────────────────────────────────────────────────────────
 class Recorder:
     """Mic capture that starts as fast as possible.
@@ -587,8 +600,10 @@ def main():
             _log_run(timestamp, audio_secs, transcribe_secs)
 
             proc_secs = sum(_perf.values())
+            avg_speed, avg_n = _rolling_speed()
             subprocess.run(["notify-send", "-t", "2000",
-                            f"STT — {proc_secs:.1f}s response : {audio_secs:.1f}s audio",
+                            f"STT — {proc_secs:.1f}s response : {audio_secs:.1f}s audio"
+                            f" · {audio_secs / proc_secs:.1f}× (avg {avg_speed:.1f}× / {avg_n})",
                             formatted])
             break  # success
 
