@@ -238,6 +238,8 @@ XMESSAGE_STYLE = [
     "-xrm", "*message.topMargin: 6", "-xrm", "*message.bottomMargin: 2",
     "-xrm", "*message*background: #2e3436",
 ]
+# 0.0 = invisible, 1.0 = opaque. Honored by compositing WMs (GNOME Shell / mutter).
+DIALOG_OPACITY = 0.85
 DIALOG_STARTING  = ("Starting...  ", "#888a85")
 DIALOG_RECORDING = ("Recording    ", "#f25c5c")
 
@@ -280,6 +282,9 @@ def _style_dialog_window(proc: subprocess.Popen, replace: subprocess.Popen | Non
         # _MOTIF_WM_HINTS flags=2 (decorations), decorations=0 -> no title bar / frame
         subprocess.run(["xprop", "-id", wid, "-f", "_MOTIF_WM_HINTS", "32c",
                         "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"], **quiet)
+        opacity = hex(int(max(0.0, min(1.0, DIALOG_OPACITY)) * 0xFFFFFFFF))
+        subprocess.run(["xprop", "-id", wid, "-f", "_NET_WM_WINDOW_OPACITY", "32c",
+                        "-set", "_NET_WM_WINDOW_OPACITY", opacity], **quiet)
         subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,above"], **quiet)
     if replace is not None and replace.poll() is None:
         # Hand keyboard focus over only if the old window had it, so Enter still
