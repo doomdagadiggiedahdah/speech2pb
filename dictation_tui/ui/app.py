@@ -158,7 +158,14 @@ class DictationApp(App):
 
         llm_cfg = self.config.get("llm", {})
         self._llm_endpoint = llm_cfg.get("endpoint", "http://localhost:11434/api/generate")
-        self._llm_model = llm_cfg.get("model", "granite4:micro")
+        self._llm_model = llm_cfg.get("model", "hf.co/superwhisper/s1-mini-GGUF:Q4_K_M")
+        self._llm_backend = llm_cfg.get("backend", "s1")
+        self._llm_timeout = llm_cfg.get("timeout", 120.0)
+
+        s1_cfg = self.config.get("s1", {})
+        self._s1_styling = s1_cfg.get("styling", "semi-formal")
+        self._s1_structure = s1_cfg.get("structure", "prose")
+        self._s1_context = s1_cfg.get("context", "general")
 
         self.raw_buffer = RawBuffer()
         self.clean_buffer = CleanBuffer()
@@ -169,6 +176,8 @@ class DictationApp(App):
         self._reset_event = asyncio.Event()
         self._asr_task = None
         self._loading_screen = None
+        self._warmup_task = None
+        self._llm_ready = False
 
     def compose(self) -> ComposeResult:
         yield RawPane()
@@ -200,6 +209,26 @@ class DictationApp(App):
             )
         )
 
+        # Preload s1-mini so its ~86s cold load overlaps the NeMo load instead of
+        # landing on the user's first Enter.
+        if self._llm_polish and self._llm_backend == "s1":
+            self._warmup_task = asyncio.create_task(self._warmup_llm())
+
+    async def _warmup_llm(self):
+        """Load s1-mini into VRAM in the background. Never blocks or raises."""
+        from ..cleanup import warmup_s1
+
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(
+            None,
+            partial(warmup_s1, endpoint=self._llm_endpoint, model=self._llm_model),
+        )
+        self._llm_ready = ok
+        if not ok:
+            # Cleanup still falls back to the formatter, so this is a warning.
+            self.notify("s1-mini warmup failed — cleanup will use the formatter",
+                        severity="warning")
+
     async def _on_model_loaded(self):
         """Called once ASR model is loaded and mic is open."""
         if self._loading_screen:
@@ -217,22 +246,38 @@ class DictationApp(App):
         if text.strip():
             raw_pane.write(f"[dim]{text}[/dim]")
 
+        # Everything currently uncommitted is what Enter will send in one go.
+        self.query_one(StatusBar).word_count = len(self.raw_buffer.get_full_text().split())
+
     async def _process_segment(self, segment: Segment):
         """Clean a segment and update the clean pane."""
         loop = asyncio.get_event_loop()
         prev = self.clean_buffer.segments[-1] if self.clean_buffer.segments else None
 
-        cleaned_seg = await loop.run_in_executor(
-            None,
-            partial(
-                cleanup, segment,
-                prev_segment=prev,
-                remove_fillers=self._remove_fillers,
-                llm_polish=self._llm_polish,
-                llm_endpoint=self._llm_endpoint,
-                llm_model=self._llm_model,
-            ),
-        )
+        status = self.query_one(StatusBar)
+        if self._llm_polish:
+            status.cleaning = True
+        try:
+            cleaned_seg = await loop.run_in_executor(
+                None,
+                partial(
+                    cleanup, segment,
+                    prev_segment=prev,
+                    remove_fillers=self._remove_fillers,
+                    llm_polish=self._llm_polish,
+                    llm_endpoint=self._llm_endpoint,
+                    llm_model=self._llm_model,
+                    llm_backend=self._llm_backend,
+                    llm_timeout=self._llm_timeout,
+                    s1_styling=self._s1_styling,
+                    s1_structure=self._s1_structure,
+                    s1_context=self._s1_context,
+                ),
+            )
+        finally:
+            status.cleaning = False
+
+        status.last_source = cleaned_seg.cleanup_source
         self.clean_buffer.add(cleaned_seg)
 
         clean_pane = self.query_one(CleanPane)
@@ -249,6 +294,7 @@ class DictationApp(App):
             self._reset_event.set()
             self.raw_buffer.segments.clear()
             self.query_one(RawPane).clear()
+            self.query_one(StatusBar).word_count = 0
             # Process cleanup, copy, save in background
             asyncio.create_task(self._commit_and_copy(seg))
         else:
@@ -294,6 +340,12 @@ class DictationApp(App):
         self._llm_polish = not self._llm_polish
         self.query_one(StatusBar).llm_enabled = self._llm_polish
         self.notify(f"LLM polish: {'on' if self._llm_polish else 'off'}")
+        # Toggled on without a startup warmup (config had it off) — warm it now
+        # rather than making the next Enter pay the cold load.
+        if (self._llm_polish and self._llm_backend == "s1"
+                and not self._llm_ready
+                and (self._warmup_task is None or self._warmup_task.done())):
+            self._warmup_task = asyncio.create_task(self._warmup_llm())
 
     def action_clear_all(self):
         self.raw_buffer.clear()
@@ -301,6 +353,7 @@ class DictationApp(App):
         self.query_one(RawPane).clear()
         self.query_one(CleanPane).cleaned_text = ""
         self.query_one(StatusBar).segment_count = 0
+        self.query_one(StatusBar).word_count = 0
         self._reset_event.set()
         self.notify("Cleared")
 
