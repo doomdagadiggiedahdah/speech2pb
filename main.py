@@ -171,7 +171,6 @@ def _draw_wait_curve(runs, fit, current, path: Path):
     img.save(path)
 
 def _notify_result(audio_secs: float, wait_secs: float, text: str):
-    import html
     runs = _pipeline_runs()
     fit = _fit_wait_curve(runs)
     rows = [f"transcribed in {wait_secs:.1f}s · {audio_secs / wait_secs:.1f}× realtime"]
@@ -188,7 +187,7 @@ def _notify_result(audio_secs: float, wait_secs: float, text: str):
         cmd += ["-i", str(curve_png)]
     except Exception as e:
         log.debug("wait curve not drawn: %s", e)
-    subprocess.run(cmd + [f"STT · {audio_secs:.1f}s audio", "\n".join(rows) + "\n" + html.escape(text)])
+    subprocess.run(cmd + [f"STT · {audio_secs:.1f}s audio", "\n".join(rows) + "\n" + text])
 
 # ── recording ─────────────────────────────────────────────────────────────────
 class Recorder:
