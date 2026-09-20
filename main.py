@@ -28,6 +28,7 @@ FW_MODEL     = "small"  # overwritten at runtime by _get_active_model()
 FW_DEVICE    = os.environ.get("FW_DEVICE",  "cuda")
 FW_COMPUTE   = os.environ.get("FW_COMPUTE", "int8_float16")
 ATEMPO       = float(os.environ.get("ATEMPO", "1.5"))
+PIPELINE     = "unsliced-v1"  # tag written to runs.jsonl; "sliced-12s" was the pre-2026-09-19 path
 
 # ── model rotation ────────────────────────────────────────────────────────────
 BENCH_MODELS        = ["distil-large-v3.5"]
@@ -102,6 +103,23 @@ def _log_perf_summary(audio_secs: float = 0, rtf: float = 0):
     if audio_secs:
         lines.append(f"  audio: {audio_secs:.1f}s  rtf: {rtf:.2f}x  ({1/rtf:.1f}x realtime)")
     log.info("\n".join(lines))
+
+def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float):
+    """Append one JSON line per run to .output/runs.jsonl — the dataset for judging
+    pipeline changes. Bump PIPELINE whenever the transcription path changes."""
+    entry = {
+        "timestamp": timestamp,
+        "pipeline": PIPELINE,
+        "model": FW_MODEL,
+        "daemon": use_daemon,
+        "audio_secs": round(audio_secs, 1),
+        "transcribe_secs": round(transcribe_secs, 2),
+        "wait_secs": round(sum(_perf.values()), 2),
+        "predicted_old_wait_secs": round(0.27 * audio_secs + 1.9, 2),
+        "perf": {k: round(v, 3) for k, v in _perf.items()},
+    }
+    with open(OUTPUT_DIR / "runs.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 # ── recording ─────────────────────────────────────────────────────────────────
 class Recorder:
@@ -566,6 +584,7 @@ def main():
             _tick("clipboard + history")
 
             _log_perf_summary(audio_secs=audio_secs, rtf=rtf)
+            _log_run(timestamp, audio_secs, transcribe_secs)
 
             proc_secs = sum(_perf.values())
             subprocess.run(["notify-send", "-t", "2000",

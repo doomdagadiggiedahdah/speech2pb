@@ -9,8 +9,6 @@ MODEL_SIZE   = os.environ.get("FW_MODEL", "small")
 DEVICE       = os.environ.get("FW_DEVICE", "cuda")
 COMPUTE_TYPE = os.environ.get("FW_COMPUTE", "int8_float16")
 
-CHUNK_SEC    = float(os.environ.get("CHUNK_SEC", "12.0"))   # slightly longer default
-OVERLAP_SEC  = float(os.environ.get("OVERLAP_SEC", "1.0"))
 BEAM_SIZE    = int(os.environ.get("BEAM_SIZE", "3"))
 
 # Less aggressive VAD defaults
@@ -68,21 +66,11 @@ def transcribe_stream(path, model=None):
 
     if model is None:
         model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-    total_sec = len(audio) / sr
 
-    if total_sec <= CHUNK_SEC * 1.2:
-        yield from _transcribe_segments(model, audio, sr, use_vad=True)
-        return
-
-    start = 0.0
-    while start < total_sec:
-        end = min(total_sec, start + CHUNK_SEC)
-        s = int(start * sr)
-        e = int(end * sr)
-        yield from _transcribe_segments(model, audio[s:e], sr, use_vad=True)
-        if end >= total_sec:
-            break
-        start = max(0.0, end - OVERLAP_SEC)
+    # One call for the whole file: faster-whisper windows it into 30s pieces itself.
+    # Manual 12s slicing cost ~4.4s per slice regardless of content (every call
+    # encodes a padded 30s window) and made long recordings ~4x slower.
+    yield from _transcribe_segments(model, audio, sr, use_vad=True)
 
 def main(path):
     """Return full transcript as a single string (non-streaming)."""
