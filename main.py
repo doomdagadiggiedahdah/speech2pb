@@ -121,18 +121,74 @@ def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float):
     with open(OUTPUT_DIR / "runs.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-SPEED_WINDOW = 50  # runs pooled for the rolling average shown in the notification
+CURVE_MIN_RUNS = 5  # runs needed before the wait-vs-length fit is shown
 
-def _rolling_speed(window: int = SPEED_WINDOW) -> tuple[float, int]:
-    """(speed, n) over the last `window` runs of the current PIPELINE, where speed is
-    total audio / total wait — pooled, so short recordings don't dominate the average."""
+def _pipeline_runs() -> list[tuple[float, float]]:
+    """(audio_secs, wait_secs) for every logged run of the current PIPELINE."""
     try:
         runs = [json.loads(l) for l in (OUTPUT_DIR / "runs.jsonl").read_text().splitlines()]
     except (FileNotFoundError, json.JSONDecodeError):
-        return 0.0, 0
-    runs = [r for r in runs if r.get("pipeline") == PIPELINE][-window:]
-    wait = sum(r["wait_secs"] for r in runs)
-    return (sum(r["audio_secs"] for r in runs) / wait if wait else 0.0), len(runs)
+        return []
+    return [(r["audio_secs"], r["wait_secs"]) for r in runs if r.get("pipeline") == PIPELINE]
+
+def _fit_wait_curve(runs) -> tuple[float, float] | None:
+    """Least-squares wait = base + slope * audio. slope is the marginal cost of one more
+    second of talking (the derivative); base is what even a 1s recording pays."""
+    n = len(runs)
+    if n < CURVE_MIN_RUNS:
+        return None
+    mx = sum(x for x, _ in runs) / n
+    my = sum(y for _, y in runs) / n
+    sxx = sum((x - mx) ** 2 for x, _ in runs)
+    if sxx == 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in runs) / sxx
+    return my - slope * mx, slope
+
+def _draw_wait_curve(runs, fit, current, path: Path):
+    """Scatter of all runs + fitted line + this run highlighted, as a small PNG."""
+    from PIL import Image, ImageDraw
+    W, H, pad = 360, 200, 28
+    xmax = max(60.0, max(x for x, _ in runs)) * 1.05
+    ymax = max(10.0, max(y for _, y in runs)) * 1.15
+    px = lambda x: pad + x / xmax * (W - pad - 8)
+    py = lambda y: H - pad - y / ymax * (H - pad - 8)
+    img = Image.new("RGB", (W, H), "#101418")
+    d = ImageDraw.Draw(img)
+    d.line([px(0), py(0), px(xmax), py(0)], fill="#3a3a3a")
+    d.line([px(0), py(0), px(0), py(ymax)], fill="#3a3a3a")
+    old_x = min(xmax, (ymax - 1.9) / 0.27)  # old 12s-slice fit, clipped at the top edge
+    d.line([px(0), py(1.9), px(old_x), py(1.9 + 0.27 * old_x)], fill="#a04a4a")
+    if fit:
+        d.line([px(0), py(fit[0]), px(xmax), py(fit[0] + fit[1] * xmax)], fill="#00f0ff", width=2)
+    for x, y in runs:
+        d.ellipse([px(x) - 2, py(y) - 2, px(x) + 2, py(y) + 2], fill="#8a8a8a")
+    cx, cy = px(current[0]), py(current[1])
+    d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], outline="#ff2bd6", width=2)
+    d.text((pad + 4, 4), f"wait (s) vs audio (s)   n={len(runs)}", fill="#f2f2f2")
+    d.text((W - 60, H - pad + 6), f"{xmax:.0f}s", fill="#8a8a8a")
+    d.text((2, 6), f"{ymax:.0f}", fill="#8a8a8a")
+    img.save(path)
+
+def _notify_result(audio_secs: float, wait_secs: float, text: str):
+    import html
+    runs = _pipeline_runs()
+    fit = _fit_wait_curve(runs)
+    rows = [f"transcribed in {wait_secs:.1f}s · {audio_secs / wait_secs:.1f}× realtime"]
+    if fit:
+        expected = fit[0] + fit[1] * audio_secs
+        rows.append(f"curve {fit[0]:.1f}s + {fit[1]:.2f}s per s (n={len(runs)})")
+        rows.append(f"expected {expected:.1f}s · this run {wait_secs - expected:+.1f}s")
+    else:
+        rows.append(f"curve: {max(0, CURVE_MIN_RUNS - len(runs))} more runs needed")
+    cmd = ["notify-send", "-t", "2000"]
+    try:
+        curve_png = OUTPUT_DIR / "wait_curve.png"
+        _draw_wait_curve(runs or [(audio_secs, wait_secs)], fit, (audio_secs, wait_secs), curve_png)
+        cmd += ["-i", str(curve_png)]
+    except Exception as e:
+        log.debug("wait curve not drawn: %s", e)
+    subprocess.run(cmd + [f"STT · {audio_secs:.1f}s audio", "\n".join(rows) + "\n" + html.escape(text)])
 
 # ── recording ─────────────────────────────────────────────────────────────────
 class Recorder:
@@ -600,11 +656,7 @@ def main():
             _log_run(timestamp, audio_secs, transcribe_secs)
 
             proc_secs = sum(_perf.values())
-            avg_speed, avg_n = _rolling_speed()
-            subprocess.run(["notify-send", "-t", "2000",
-                            f"STT — {proc_secs:.1f}s response : {audio_secs:.1f}s audio"
-                            f" · {audio_secs / proc_secs:.1f}× (avg {avg_speed:.1f}× / {avg_n})",
-                            formatted])
+            _notify_result(audio_secs, proc_secs, formatted)
             break  # success
 
         except Exception as e:
