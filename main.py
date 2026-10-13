@@ -104,7 +104,7 @@ def _log_perf_summary(audio_secs: float = 0, rtf: float = 0):
         lines.append(f"  audio: {audio_secs:.1f}s  rtf: {rtf:.2f}x  ({1/rtf:.1f}x realtime)")
     log.info("\n".join(lines))
 
-def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float):
+def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float, queued_secs: float = 0.0):
     """Append one JSON line per run to .output/runs.jsonl — the dataset for judging
     pipeline changes. Bump PIPELINE whenever the transcription path changes."""
     entry = {
@@ -115,6 +115,7 @@ def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float):
         "audio_secs": round(audio_secs, 1),
         "transcribe_secs": round(transcribe_secs, 2),
         "wait_secs": round(sum(_perf.values()), 2),
+        "queued_secs": round(queued_secs, 2),
         "predicted_old_wait_secs": round(0.27 * audio_secs + 1.9, 2),
         "perf": {k: round(v, 3) for k, v in _perf.items()},
     }
@@ -170,10 +171,11 @@ def _draw_wait_curve(runs, fit, current, path: Path):
     d.text((2, 6), f"{ymax:.0f}", fill="#8a8a8a")
     img.save(path)
 
-def _notify_result(audio_secs: float, wait_secs: float, text: str):
+def _notify_result(audio_secs: float, wait_secs: float, text: str, queued_secs: float = 0.0):
     runs = _pipeline_runs()
     fit = _fit_wait_curve(runs)
-    rows = [f"L={audio_secs:.1f}s  RT={audio_secs / wait_secs:.1f}×"]
+    rows = [f"L={audio_secs:.1f}s  RT={audio_secs / wait_secs:.1f}×"
+            + (f"  (+{queued_secs:.1f}s queued)" if queued_secs >= 0.1 else "")]
     if fit:
         expected = fit[0] + fit[1] * audio_secs
         rows.append(f"t={wait_secs:.1f}s  E[t]={expected:.1f}s  Δ={wait_secs - expected:+.1f}s")
@@ -262,23 +264,30 @@ def save_m4a(audio, path: Path):
         os.unlink(tmp.name)
 
 # ── transcription ─────────────────────────────────────────────────────────────
-def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, float]:
-    """Returns (text, elapsed_secs, rtf). Uses daemon if available, else local model."""
+def _notify_queued():
+    subprocess.Popen(["notify-send", "-t", "1500", "STT", "in queue!"])
+
+def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, float, float]:
+    """Returns (text, elapsed_secs, rtf, queued_secs). Uses daemon if available, else local model.
+    elapsed/rtf cover only the transcription; time spent waiting for the GPU is queued_secs."""
     t0 = datetime.now()
+    queued = 0.0
     if use_daemon:
         import stt_client
-        resp = stt_client.send_transcribe(str(audio_path))
+        resp = stt_client.send_transcribe(str(audio_path), on_queued=_notify_queued)
         if "error" in resp:
             raise RuntimeError(f"daemon error: {resp['error']}")
         result = resp["text"]
+        queued = resp["queued"]
     else:
         model_ready.wait()
         import local_transcribe as lt
         result = "".join(lt.transcribe_stream(str(audio_path), model=model)).strip()
-    elapsed = (datetime.now() - t0).total_seconds()
+    elapsed = (datetime.now() - t0).total_seconds() - queued
     rtf = elapsed / original_secs if original_secs > 0 else 0
-    log.info("transcription done in %.2fs (audio: %.1fs, rtf: %.2fx)", elapsed, original_secs, rtf)
-    return result, elapsed, rtf
+    log.info("transcription done in %.2fs (audio: %.1fs, rtf: %.2fx, queued %.2fs)",
+             elapsed, original_secs, rtf, queued)
+    return result, elapsed, rtf, queued
 
 # ── GPT formatting ────────────────────────────────────────────────────────────
 def format_text(text: str, api_key: str) -> str:
@@ -635,8 +644,9 @@ def main():
     for attempt in range(1, 4):
         try:
             log.info("transcribing (attempt %d)...", attempt)
-            stt_result, transcribe_secs, rtf = transcribe(fast_file, audio_secs)
+            stt_result, transcribe_secs, rtf, queued_secs = transcribe(fast_file, audio_secs)
             _tick("whisper transcribe")
+            _perf["whisper transcribe"] -= queued_secs  # GPU queue wait isn't pipeline time
             if not stt_result:
                 raise RuntimeError("transcription returned empty result")
             log.info("transcript: %s...", stt_result[:60])
@@ -652,10 +662,10 @@ def main():
             _tick("clipboard + history")
 
             _log_perf_summary(audio_secs=audio_secs, rtf=rtf)
-            _log_run(timestamp, audio_secs, transcribe_secs)
+            _log_run(timestamp, audio_secs, transcribe_secs, queued_secs)
 
             proc_secs = sum(_perf.values())
-            _notify_result(audio_secs, proc_secs, formatted)
+            _notify_result(audio_secs, proc_secs, formatted, queued_secs)
             break  # success
 
         except Exception as e:

@@ -68,11 +68,53 @@ TRANSCRIBE_OPTIONS = {
 }
 
 
-def send_transcribe(audio_path: str) -> dict:
+QUEUED_AFTER = 0.3  # no "started" from the daemon by then → the GPU is busy (or loading)
+
+
+def send_transcribe(audio_path: str, on_queued=None) -> dict:
+    """Stream an interactive job. Returns {"text", "elapsed", "queued", "work"} or {"error"}.
+    queued = waiting for the GPU; work = the transcription itself.
+    `on_queued()` fires once if the worker hasn't picked the job up within QUEUED_AFTER."""
     path = str(Path(audio_path).resolve())
-    return _send({"cmd": "transcribe", "audio_path": path, "priority": "interactive",
-                  "options": TRANSCRIBE_OPTIONS},
-                 timeout=_transcribe_timeout(path))
+    timeout = _transcribe_timeout(path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(str(SOCKET_PATH))
+    try:
+        sock.sendall(json.dumps({"cmd": "transcribe", "audio_path": path, "priority": "interactive",
+                                 "options": TRANSCRIBE_OPTIONS, "stream": True}).encode() + b"\n")
+        if on_queued:
+            sock.settimeout(QUEUED_AFTER)
+        buf, texts = b"", []
+        while True:
+            while b"\n" not in buf:
+                try:
+                    chunk = sock.recv(65536)
+                except TimeoutError:
+                    if not on_queued:
+                        raise
+                    on_queued()
+                    on_queued = None
+                    sock.settimeout(timeout)
+                    continue
+                if not chunk:
+                    return {"error": "gpu-queued closed the connection mid-job"}
+                buf += chunk
+            line, buf = buf.split(b"\n", 1)
+            msg = json.loads(line)
+            event = msg.get("event")
+            if event == "started" and on_queued:
+                on_queued = None
+                sock.settimeout(timeout)
+            elif event == "segment":
+                texts.append(msg["text"])
+            elif event == "done":
+                return {"text": "".join(texts).strip(), "elapsed": msg["elapsed"],
+                        "queued": msg.get("queued", 0.0), "work": msg.get("work", msg["elapsed"])}
+            elif event == "error" or "error" in msg:
+                return {"error": msg.get("error", "unknown error")}
+    finally:
+        sock.close()
 
 
 def send_status() -> dict:
