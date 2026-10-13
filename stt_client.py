@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-stt_client — send commands to stt_daemon.
+stt_client — send commands to gpu-queued (../gpu-queued), the GPU owner.
+Hotkey jobs go in at "interactive" priority, ahead of batch work.
 
 Usage:
     ./stt_client.py preload                # tell daemon to start loading model
@@ -8,10 +9,10 @@ Usage:
     ./stt_client.py status                 # check daemon state
     ./stt_client.py unload                 # free GPU memory
 """
-import contextlib, json, socket, sys, wave
+import contextlib, json, os, socket, sys, wave
 from pathlib import Path
 
-SOCKET_PATH = Path(__file__).parent / ".output" / "stt.sock"
+SOCKET_PATH = Path(os.environ.get("GPUQ_SOCKET", f"/run/user/{os.getuid()}/gpu-queued.sock"))
 TIMEOUT = 120  # floor, for short clips and non-transcribe commands
 
 # Transcription time scales with audio length (~0.3-0.4x RTF observed), so a fixed
@@ -54,9 +55,23 @@ def _transcribe_timeout(audio_path: str) -> float:
     return max(TIMEOUT, _audio_secs(audio_path) * RTF_BUDGET + QUEUE_SLACK)
 
 
+# Decoding settings that local_transcribe.py used when stt_daemon ran it; gpu-queued
+# is model-agnostic, so the client now sends them with each job.
+TRANSCRIBE_OPTIONS = {
+    "beam_size": int(os.environ.get("BEAM_SIZE", "3")),
+    "temperature": 0.0,
+    "vad_filter": os.environ.get("DISABLE_VAD", "0") != "1",
+    "vad_parameters": {
+        "min_silence_duration_ms": int(os.environ.get("VAD_MIN_SILENCE_MS", "150")),
+        "speech_pad_ms": int(os.environ.get("VAD_SPEECH_PAD_MS", "400")),
+    },
+}
+
+
 def send_transcribe(audio_path: str) -> dict:
     path = str(Path(audio_path).resolve())
-    return _send({"cmd": "transcribe", "audio_path": path},
+    return _send({"cmd": "transcribe", "audio_path": path, "priority": "interactive",
+                  "options": TRANSCRIBE_OPTIONS},
                  timeout=_transcribe_timeout(path))
 
 
@@ -126,7 +141,7 @@ def main():
                 sys.exit(2)
 
     except (ConnectionRefusedError, FileNotFoundError):
-        print("error: daemon not running — start with: ./stt_daemon.py", file=sys.stderr)
+        print("error: gpu-queued not running — systemctl --user start gpu-queued", file=sys.stderr)
         sys.exit(1)
 
 
