@@ -156,7 +156,7 @@ main() {
     paplay /usr/share/sounds/alsa/Front_Left.wav 2>/dev/null &
 
     # Copy to clipboard
-    echo "$formatted_result" | xclip -selection clipboard
+    echo "$formatted_result" | wl-copy
     
     # Display final message with file locations
     if [[ $DEBUG -eq 1 ]]; then

@@ -46,4 +46,4 @@ TIMESTAMP=$(basename "$AUDIO_FILE" | sed 's/original_//;s/.m4a//')
 echo "$stt_result" > "$TRANSCRIPT_DIR/raw_transcript_$TIMESTAMP.txt"
 
 # Optional: Copy the result to clipboard
-echo "$stt_result" | xclip -selection clipboard
+echo "$stt_result" | wl-copy

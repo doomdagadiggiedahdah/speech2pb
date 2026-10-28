@@ -55,15 +55,15 @@ def clean_transcript(text: str) -> str:
 
 
 def copy_to_clipboard(text: str):
-    """Copy text to X11 clipboard via xclip."""
+    """Copy text to the clipboard via wl-copy."""
     try:
         proc = subprocess.Popen(
-            ["xclip", "-selection", "clipboard"],
+            ["wl-copy"],
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         proc.communicate(text.encode(), timeout=2)
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        print("[clipboard copy failed — is xclip installed?]", file=sys.stderr)
+        print("[clipboard copy failed — is wl-clipboard installed?]", file=sys.stderr)
 
 
 def _sunday_of_week(week_num: int, year: int) -> date:
