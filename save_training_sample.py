@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# WAYLAND-BROKEN (2026-10-05): synthetic keypresses (pyautogui / xdotool) never reach native-Wayland
+# windows, so the selection / URL grab silently fails. Fix pattern = quote.py in .setup/hotkeys
+# (wl-paste for selection, ydotool for keys, shared helper planned as .setup/util/waykeys.py).
+# Full context + plan: claude -r 6e6d343a-9535-4386-9d46-ef4e954bc3a6   (session 'wayland port: hotkeys, dmenu, xclip, ydotool')
 """
 Save a training sample: pairs the most recent STT audio with user-corrected text.
 
@@ -23,7 +27,7 @@ MANIFEST = TRAINING_DIR / "manifest.jsonl"
 
 def get_x11_text(selection):
     r = subprocess.run(
-        ["xclip", "-selection", selection, "-o"],
+        ["wl-paste", "-n"] + (["--primary"] if selection == "primary" else []),
         capture_output=True, text=True,
     )
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -69,7 +73,7 @@ def main():
         f.write(json.dumps(entry, indent=2) + "\n")
 
     # Put corrected text on clipboard and paste back over selection
-    subprocess.run(["xclip", "-selection", "clipboard"],
+    subprocess.run(["wl-copy"],
                    input=corrected.encode(), check=True)
     subprocess.run(["xdotool", "key", "--delay", "50", "ctrl+v"])
 

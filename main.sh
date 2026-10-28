@@ -141,7 +141,7 @@ main() {
   fi
 
   # Copy to clipboard always
-  echo "$formatted_result" | xclip -selection clipboard
+  echo "$formatted_result" | wl-copy
 
   if [[ $OPEN_CHAT -eq 0 ]]; then
     notify-send -t 2000 'STT' "$formatted_result"

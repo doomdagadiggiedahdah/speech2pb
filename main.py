@@ -11,6 +11,7 @@ Flow:
   6. Clipboard + notification
 """
 import os, sys, threading, subprocess, tempfile, json, traceback, urllib.request, logging
+subprocess.Popen(["/home/mat/Documents/ProgramExperiments/.setup/util/ported-note", "stt_hk", "transcript now copied with wl-copy; overlay placement (xdotool/wmctrl) still X11"])
 from datetime import datetime
 from pathlib import Path
 
@@ -264,8 +265,21 @@ def save_m4a(audio, path: Path):
         os.unlink(tmp.name)
 
 # ── transcription ─────────────────────────────────────────────────────────────
-def _notify_queued():
-    subprocess.Popen(["notify-send", "-t", "1500", "STT", "in queue!"])
+def _notify_if_preempting(audio_path: Path):
+    """Heads-up only when a batch job (e.g. fleeting notes) holds the GPU: gpu-queued
+    finishes its current chunk, runs this hotkey job, then resumes the batch.
+    A cold model load on its own is not worth a notification."""
+    import stt_client
+    try:
+        run = stt_client.send_status().get("running") or {}
+    except Exception:
+        return
+    if run.get("priority") != "batch" or run.get("name") == audio_path.name:
+        return
+    name, done, dur = run.get("name", "?"), run.get("done") or 0, run.get("duration")
+    pct = f" ({done / dur:.0%})" if dur else ""
+    subprocess.Popen(["notify-send", "-t", "3000", "STT",
+                      f"heads up: finishing a chunk of {name}{pct}, then yours"])
 
 def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, float, float]:
     """Returns (text, elapsed_secs, rtf, queued_secs). Uses daemon if available, else local model.
@@ -274,7 +288,7 @@ def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, floa
     queued = 0.0
     if use_daemon:
         import stt_client
-        resp = stt_client.send_transcribe(str(audio_path), on_queued=_notify_queued)
+        resp = stt_client.send_transcribe(str(audio_path), on_queued=lambda: _notify_if_preempting(audio_path))
         if "error" in resp:
             raise RuntimeError(f"daemon error: {resp['error']}")
         result = resp["text"]
@@ -657,7 +671,7 @@ def main():
             print(formatted)
             update_history(formatted)
 
-            subprocess.run(["xclip", "-selection", "clipboard"],
+            subprocess.run(["wl-copy"],
                            input=formatted.encode(), check=True)
             _tick("clipboard + history")
 
