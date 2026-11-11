@@ -193,6 +193,24 @@ def _notify_result(audio_secs: float, wait_secs: float, text: str, queued_secs: 
     subprocess.run(cmd + ["STT", "\n".join(rows)])
 
 # ── recording ─────────────────────────────────────────────────────────────────
+# Preferred mics, in order: (ALSA card name substring, PipeWire source node).
+# The first one plugged in wins; if none is, pw-record uses the system default
+# (the laptop mic). Checked via /proc/asound/cards — instant, no PipeWire query.
+# Override with STT_MIC=<node name>.
+PREFERRED_MICS = [
+    ("Sennheiser XS LAV USB-C",
+     "alsa_input.usb-Sennheiser_Sennheiser_XS_LAV_USB-C_000000000000-00.mono-fallback"),
+]
+
+def preferred_mic() -> str | None:
+    if os.environ.get("STT_MIC"):
+        return os.environ["STT_MIC"]
+    try:
+        cards = Path("/proc/asound/cards").read_text()
+    except OSError:
+        return None
+    return next((node for card, node in PREFERRED_MICS if card in cards), None)
+
 class Recorder:
     """Mic capture that starts as fast as possible.
 
@@ -204,9 +222,11 @@ class Recorder:
         self._chunks: list = []
         self._proc = None
         self._stream = None
+        self.mic = preferred_mic()
+        target = ["--target", self.mic] if self.mic else []
         try:
             self._proc = subprocess.Popen(
-                ["pw-record", "--rate", str(SAMPLE_RATE), "--channels", "1",
+                ["pw-record", *target, "--rate", str(SAMPLE_RATE), "--channels", "1",
                  "--format", "f32", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self._reader = threading.Thread(target=self._read_pipe, daemon=True)
@@ -609,7 +629,13 @@ def main():
 
     # 3. Start recording, then swap the dialog to "Recording" once the mic is live
     recorder = Recorder()
-    log.info("recording started (%s)", recorder.backend)
+    log.info("recording started (%s, mic=%s)", recorder.backend, recorder.mic or "default")
+    if recorder.mic:
+        # Close-mic whispering is unvoiced, and Silero VAD drops all of it as
+        # silence (2026-11-11: empty transcript with VAD, clean one without).
+        os.environ["DISABLE_VAD"] = "1"  # read by local_transcribe on its (later) import
+        stt_client.TRANSCRIBE_OPTIONS["vad_filter"] = False
+        stt_client.TRANSCRIBE_OPTIONS.pop("vad_parameters", None)
     recording_proc = launch_dialog(*DIALOG_RECORDING)
     threading.Thread(target=_style_dialog_window,
                      args=(recording_proc, starting_proc), daemon=True).start()
