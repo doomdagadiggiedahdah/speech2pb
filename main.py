@@ -194,10 +194,11 @@ def _notify_result(audio_secs: float, wait_secs: float, text: str, queued_secs: 
     else:
         rows.append(f"t={wait_secs:.1f}s  E[t]: n={len(runs)}/{CURVE_MIN_RUNS}")
     if pipeline != BASELINE_PIPELINE:
-        old = _fit_wait_curve(_pipeline_runs(BASELINE_PIPELINE))
+        base_runs = _pipeline_runs(BASELINE_PIPELINE)
+        old = _fit_wait_curve(base_runs)
         if old:
             old_t = old[0] + old[1] * audio_secs
-            rows.append(f"old E[t]={old_t:.1f}s ({old[0]:.1f}+{old[1]:.2f}·L)  saved {old_t - wait_secs:+.1f}s")
+            rows.append(f"old E[t]={old_t:.1f}s ({old[0]:.1f}+{old[1]:.2f}·L) n={len(base_runs)}  saved {old_t - wait_secs:+.1f}s")
     cmd = ["notify-send", "-t", "2000"]
     try:
         curve_png = OUTPUT_DIR / "wait_curve.png"
