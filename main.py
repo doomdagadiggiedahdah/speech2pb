@@ -132,6 +132,7 @@ def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float, queued_s
         f.write(json.dumps(entry) + "\n")
 
 CURVE_MIN_RUNS = 5  # runs needed before the wait-vs-length fit is shown
+BASELINE_PIPELINE = "unsliced-v1"  # pre-2026-11-16 single call; its fit is shown as "old E[t]" for comparison
 
 def _pipeline_runs(pipeline: str = PIPELINE) -> list[tuple[float, float]]:
     """(audio_secs, wait_secs) for every logged run of `pipeline`."""
@@ -192,6 +193,11 @@ def _notify_result(audio_secs: float, wait_secs: float, text: str, queued_secs: 
         rows.append(f"E[t]={fit[0]:.1f}+{fit[1]:.2f}·L  n={len(runs)}")
     else:
         rows.append(f"t={wait_secs:.1f}s  E[t]: n={len(runs)}/{CURVE_MIN_RUNS}")
+    if pipeline != BASELINE_PIPELINE:
+        old = _fit_wait_curve(_pipeline_runs(BASELINE_PIPELINE))
+        if old:
+            old_t = old[0] + old[1] * audio_secs
+            rows.append(f"old E[t]={old_t:.1f}s ({old[0]:.1f}+{old[1]:.2f}·L)  saved {old_t - wait_secs:+.1f}s")
     cmd = ["notify-send", "-t", "2000"]
     try:
         curve_png = OUTPUT_DIR / "wait_curve.png"
