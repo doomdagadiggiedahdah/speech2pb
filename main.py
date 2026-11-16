@@ -29,7 +29,13 @@ FW_MODEL     = "small"  # overwritten at runtime by _get_active_model()
 FW_DEVICE    = os.environ.get("FW_DEVICE",  "cuda")
 FW_COMPUTE   = os.environ.get("FW_COMPUTE", "int8_float16")
 ATEMPO       = float(os.environ.get("ATEMPO", "1.5"))
-PIPELINE     = "unsliced-v1"  # tag written to runs.jsonl; "sliced-12s" was the pre-2026-09-19 path
+# tag written to runs.jsonl; "unsliced-en-v1" = one call after Stop (still used when online mode is
+# off or fell back), "unsliced-v1" = before language="en" (2026-11-16), "sliced-12s" = pre-2026-09-19
+PIPELINE        = "online-v1"
+PIPELINE_SINGLE = "unsliced-en-v1"
+# Transcribe while recording (online.py): 30s windows decoded during the recording, so only the
+# tail is left after Stop. STT_ONLINE=0 restores the single call after Stop.
+ONLINE       = os.environ.get("STT_ONLINE", "1") != "0"
 
 # ── model rotation ────────────────────────────────────────────────────────────
 BENCH_MODELS        = ["distil-large-v3.5"]
@@ -105,12 +111,13 @@ def _log_perf_summary(audio_secs: float = 0, rtf: float = 0):
         lines.append(f"  audio: {audio_secs:.1f}s  rtf: {rtf:.2f}x  ({1/rtf:.1f}x realtime)")
     log.info("\n".join(lines))
 
-def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float, queued_secs: float = 0.0):
+def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float, queued_secs: float = 0.0,
+             pipeline: str = PIPELINE, extra: dict | None = None):
     """Append one JSON line per run to .output/runs.jsonl — the dataset for judging
     pipeline changes. Bump PIPELINE whenever the transcription path changes."""
     entry = {
         "timestamp": timestamp,
-        "pipeline": PIPELINE,
+        "pipeline": pipeline,
         "model": FW_MODEL,
         "daemon": use_daemon,
         "audio_secs": round(audio_secs, 1),
@@ -119,19 +126,20 @@ def _log_run(timestamp: str, audio_secs: float, transcribe_secs: float, queued_s
         "queued_secs": round(queued_secs, 2),
         "predicted_old_wait_secs": round(0.27 * audio_secs + 1.9, 2),
         "perf": {k: round(v, 3) for k, v in _perf.items()},
+        **(extra or {}),
     }
     with open(OUTPUT_DIR / "runs.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 CURVE_MIN_RUNS = 5  # runs needed before the wait-vs-length fit is shown
 
-def _pipeline_runs() -> list[tuple[float, float]]:
-    """(audio_secs, wait_secs) for every logged run of the current PIPELINE."""
+def _pipeline_runs(pipeline: str = PIPELINE) -> list[tuple[float, float]]:
+    """(audio_secs, wait_secs) for every logged run of `pipeline`."""
     try:
         runs = [json.loads(l) for l in (OUTPUT_DIR / "runs.jsonl").read_text().splitlines()]
     except (FileNotFoundError, json.JSONDecodeError):
         return []
-    return [(r["audio_secs"], r["wait_secs"]) for r in runs if r.get("pipeline") == PIPELINE]
+    return [(r["audio_secs"], r["wait_secs"]) for r in runs if r.get("pipeline") == pipeline]
 
 def _fit_wait_curve(runs) -> tuple[float, float] | None:
     """Least-squares wait = base + slope * audio. slope is the marginal cost of one more
@@ -172,8 +180,9 @@ def _draw_wait_curve(runs, fit, current, path: Path):
     d.text((2, 6), f"{ymax:.0f}", fill="#8a8a8a")
     img.save(path)
 
-def _notify_result(audio_secs: float, wait_secs: float, text: str, queued_secs: float = 0.0):
-    runs = _pipeline_runs()
+def _notify_result(audio_secs: float, wait_secs: float, text: str, queued_secs: float = 0.0,
+                   pipeline: str = PIPELINE):
+    runs = _pipeline_runs(pipeline)
     fit = _fit_wait_curve(runs)
     rows = [f"L={audio_secs:.1f}s  RT={audio_secs / wait_secs:.1f}×"
             + (f"  (+{queued_secs:.1f}s queued)" if queued_secs >= 0.1 else "")]
@@ -322,6 +331,43 @@ def transcribe(audio_path: Path, original_secs: float) -> tuple[str, float, floa
     log.info("transcription done in %.2fs (audio: %.1fs, rtf: %.2fx, queued %.2fs)",
              elapsed, original_secs, rtf, queued)
     return result, elapsed, rtf, queued
+
+class _OnlineCalls:
+    """gpu-queued calls made by online.py; tracks GPU queue time of the post-Stop calls."""
+
+    def __init__(self):
+        self.tail_queued = 0.0
+
+    def __call__(self, path: str, options: dict, final: bool) -> list:
+        import stt_client
+        on_queued = (lambda: _notify_if_preempting(Path(path))) if final else None
+        resp = stt_client.send_transcribe(path, on_queued=on_queued, options=options)
+        if "error" in resp:
+            raise RuntimeError(f"daemon error: {resp['error']}")
+        if final:
+            self.tail_queued += resp.get("queued", 0.0)
+        return resp["segments"]
+
+
+def start_online(recorder: "Recorder"):
+    """Start transcribe-while-recording on the recorder's live blocks, or None (then the
+    single call after Stop is used). Must never break the recording itself."""
+    if not (ONLINE and use_daemon):
+        return None, None
+    try:
+        import online, stt_client
+        calls = _OnlineCalls()
+        tr = online.OnlineTranscriber(
+            recorder._chunks, calls, base_options=lambda: stt_client.TRANSCRIBE_OPTIONS,
+            in_rate=SAMPLE_RATE, tempo=ATEMPO,
+            # close mic runs whisper without VAD (whispering); Silero alone would skip whispers
+            energy_guard=not stt_client.TRANSCRIBE_OPTIONS.get("vad_filter", True),
+            keepalive=stt_client.send_preload)
+        log.info("online mode on (energy guard: %s)", tr.energy_guard)
+        return tr, calls
+    except Exception as e:
+        log.warning("online mode not started: %s", e)
+        return None, None
 
 # ── GPT formatting ────────────────────────────────────────────────────────────
 def format_text(text: str, api_key: str) -> str:
@@ -639,6 +685,7 @@ def main():
     recording_proc = launch_dialog(*DIALOG_RECORDING)
     threading.Thread(target=_style_dialog_window,
                      args=(recording_proc, starting_proc), daemon=True).start()
+    online_tr, online_calls = start_online(recorder)
 
     # 4. Block until user clicks Stop / presses Enter on either window
     wait_dialogs(starting_proc, recording_proc)
@@ -656,17 +703,41 @@ def main():
     audio_secs = len(audio) / SAMPLE_RATE
     log.info("recorded %.1fs of audio", audio_secs)
 
-    # 6. Save original m4a in background (archive only — transcription doesn't need it)
-    threading.Thread(target=save_m4a, args=(audio, original_file), daemon=True).start()
+    # 6. Save original m4a in background (archive only — transcription doesn't need it).
+    # Joined before exit: with online mode the wait can be shorter than the aac encode.
+    m4a_thread = threading.Thread(target=save_m4a, args=(audio, original_file), daemon=True)
+    m4a_thread.start()
 
-    # Apply atempo to produce the file whisper will read
-    import soundfile as sf
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        sf.write(tmp.name, audio, SAMPLE_RATE)
-        apply_atempo(Path(tmp.name), fast_file, ATEMPO)
-        os.unlink(tmp.name)
-    _tick("atempo")
-    log.info("atempo %.1fx applied", ATEMPO)
+    # Online mode: only the tail is left to decode. Any failure -> the single call below.
+    online_text, online_extra, pipeline = None, {}, PIPELINE_SINGLE
+    if online_tr is not None:
+        try:
+            online_text = online_tr.finish()
+            if not online_text:   # silent, or the guard skipped everything: let the single call decide
+                raise RuntimeError("online transcript empty")
+            pipeline = PIPELINE
+        except Exception as e:
+            online_text = None
+            online_extra["online_fallback"] = str(e)[:200]
+            log.warning("online mode failed, falling back to a single call: %s", e)
+        online_extra["online"] = online_tr.stats
+        online_extra["online"]["close_mic"] = online_tr.energy_guard
+        _tick("online finish (tail)")
+        if online_text is not None:   # GPU queue wait (behind a batch chunk) isn't pipeline time
+            _perf["online finish (tail)"] -= online_calls.tail_queued
+
+    def make_fast_file():
+        """Apply atempo to produce the file whisper will read (single-call path)."""
+        import soundfile as sf
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, audio, SAMPLE_RATE)
+            apply_atempo(Path(tmp.name), fast_file, ATEMPO)
+            os.unlink(tmp.name)
+        _tick("atempo")
+        log.info("atempo %.1fx applied", ATEMPO)
+
+    if online_text is None:
+        make_fast_file()
 
     # Time how long we block waiting for the model (ideally 0 if recording was long enough)
     if not use_daemon:
@@ -684,9 +755,16 @@ def main():
     for attempt in range(1, 4):
         try:
             log.info("transcribing (attempt %d)...", attempt)
-            stt_result, transcribe_secs, rtf, queued_secs = transcribe(fast_file, audio_secs)
-            _tick("whisper transcribe")
-            _perf["whisper transcribe"] -= queued_secs  # GPU queue wait isn't pipeline time
+            if online_text is not None:
+                stt_result, queued_secs = online_text, online_calls.tail_queued
+                transcribe_secs = _perf["online finish (tail)"]
+                rtf = transcribe_secs / audio_secs if audio_secs else 0
+            else:
+                if not fast_file.exists():
+                    make_fast_file()
+                stt_result, transcribe_secs, rtf, queued_secs = transcribe(fast_file, audio_secs)
+                _tick("whisper transcribe")
+                _perf["whisper transcribe"] -= queued_secs  # GPU queue wait isn't pipeline time
             if not stt_result:
                 raise RuntimeError("transcription returned empty result")
             log.info("transcript: %s...", stt_result[:60])
@@ -702,10 +780,10 @@ def main():
             _tick("clipboard + history")
 
             _log_perf_summary(audio_secs=audio_secs, rtf=rtf)
-            _log_run(timestamp, audio_secs, transcribe_secs, queued_secs)
+            _log_run(timestamp, audio_secs, transcribe_secs, queued_secs, pipeline, online_extra)
 
             proc_secs = sum(_perf.values())
-            _notify_result(audio_secs, proc_secs, formatted, queued_secs)
+            _notify_result(audio_secs, proc_secs, formatted, queued_secs, pipeline)
             break  # success
 
         except Exception as e:
@@ -718,6 +796,17 @@ def main():
     # 11. Feedback + milestone reminder (disabled)
     # ask_and_record_feedback(timestamp, FW_MODEL, audio_secs, rtf)
     # _maybe_remind_analysis(total_runs)
+
+    # Archive the stretched audio as today's fast_*.wav (online mode never wrote one; 16 kHz here)
+    if online_tr is not None:
+        if not fast_file.exists():
+            try:
+                import soundfile as sf
+                sf.write(fast_file, online_tr.audio(), 16000)
+            except Exception as e:
+                log.warning("fast wav not archived: %s", e)
+        online_tr.close()
+    m4a_thread.join(timeout=120)
 
     log.debug("original: %s", original_file)
 

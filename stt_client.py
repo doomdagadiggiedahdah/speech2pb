@@ -60,6 +60,8 @@ def _transcribe_timeout(audio_path: str) -> float:
 TRANSCRIBE_OPTIONS = {
     "beam_size": int(os.environ.get("BEAM_SIZE", "3")),
     "temperature": 0.0,
+    # Skip language auto-detect: it costs a full extra encoder pass (~2.0s/call on the T1000).
+    "language": os.environ.get("STT_LANGUAGE", "en"),
     "vad_filter": os.environ.get("DISABLE_VAD", "0") != "1",
     "vad_parameters": {
         "min_silence_duration_ms": int(os.environ.get("VAD_MIN_SILENCE_MS", "150")),
@@ -71,9 +73,12 @@ TRANSCRIBE_OPTIONS = {
 QUEUED_AFTER = 0.3  # no "started" from the daemon by then → the GPU is busy (or loading)
 
 
-def send_transcribe(audio_path: str, on_queued=None) -> dict:
-    """Stream an interactive job. Returns {"text", "elapsed", "queued", "work"} or {"error"}.
-    queued = waiting for the GPU; work = the transcription itself.
+def send_transcribe(audio_path: str, on_queued=None, options: dict | None = None) -> dict:
+    """Stream an interactive job. Returns {"text", "elapsed", "queued", "work", "segments"} or {"error"}.
+    queued = waiting for the GPU; work = the transcription itself. segments = the raw segment
+    events (start/end/text, plus no_speech_prob/avg_logprob/compression_ratio and, with
+    word_timestamps, words=[[start, end, word, prob], ...] when gpu-queued reports them).
+    `options` overrides TRANSCRIBE_OPTIONS for this call (online mode sends per-window options).
     `on_queued()` fires once if the worker hasn't picked the job up within QUEUED_AFTER."""
     path = str(Path(audio_path).resolve())
     timeout = _transcribe_timeout(path)
@@ -82,10 +87,11 @@ def send_transcribe(audio_path: str, on_queued=None) -> dict:
     sock.connect(str(SOCKET_PATH))
     try:
         sock.sendall(json.dumps({"cmd": "transcribe", "audio_path": path, "priority": "interactive",
-                                 "options": TRANSCRIBE_OPTIONS, "stream": True}).encode() + b"\n")
+                                 "options": TRANSCRIBE_OPTIONS if options is None else options,
+                                 "stream": True}).encode() + b"\n")
         if on_queued:
             sock.settimeout(QUEUED_AFTER)
-        buf, texts = b"", []
+        buf, texts, segments = b"", [], []
         while True:
             while b"\n" not in buf:
                 try:
@@ -108,9 +114,11 @@ def send_transcribe(audio_path: str, on_queued=None) -> dict:
                 sock.settimeout(timeout)
             elif event == "segment":
                 texts.append(msg["text"])
+                segments.append(msg)
             elif event == "done":
                 return {"text": "".join(texts).strip(), "elapsed": msg["elapsed"],
-                        "queued": msg.get("queued", 0.0), "work": msg.get("work", msg["elapsed"])}
+                        "queued": msg.get("queued", 0.0), "work": msg.get("work", msg["elapsed"]),
+                        "segments": segments}
             elif event == "error" or "error" in msg:
                 return {"error": msg.get("error", "unknown error")}
     finally:
