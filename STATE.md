@@ -58,6 +58,13 @@ Replay (real gpu-queued, 3-4× speed), wait after Stop vs old single call:
 | 450s | close | 18 | 5.35 | 29.20 | .238 (.100) |
 | 90s silent | both | 0 (2 skipped) | ~0.05 | 1.1–7.4 | 0 words |
 
+**Bug fixed 2026-11-16:** pw-record without `--raw` prepended a 24-byte AU header → 6 bogus float
+samples incl. a NaN. Harmless for the 16-bit single call, but in the float online stream it emptied
+window 0 (lost first window on 033932; empty tail → fallback on 034322). Fixed with `--raw` plus a NaN
+guard in `online._feed`. New diagnostics: `windows_empty`, `nonfinite_samples`, and `online_tail_<ts>.wav` saved on
+empty or fail. Lesson: replay bypasses pw-record, so recorder-side bugs need the pw-loopback e2e harness
+(`.output/investigations/2026-11-16_lang-en-and-online/e2e/`).
+
 Watch-outs: whispered close-mic audio is shaky (one 42-word run lost on 193845, unclear if online-specific);
 short dictations can wait ~1-2s *longer* if a window is mid-decode at Stop; windows preempt local batch
 jobs while recording; archived fast wav is now 16 kHz. Replay harness: `replay_online.py`.

@@ -21,7 +21,7 @@ def _load(path, rate, tempo=None):
 
 @pytest.fixture(scope="module")
 def sample():
-    big = [p for p in AUDIO[-200:] if 60_000 < p.stat().st_size]
+    big = [p for p in AUDIO[-200:] if 3_000_000 < p.stat().st_size]   # >= ~2 min: tests slice 100s
     if not big:
         pytest.skip("no archived recordings")
     return big[-1]
@@ -101,3 +101,30 @@ def test_online_end_to_end_with_fake_model(sample):
     assert calls[-1][1] is True and all(not f for _, f, _ in calls[:-1])
     assert len(text.split()) > 10
     assert o.stats["windows_sent"] >= 1
+
+
+def test_nonfinite_and_unaligned_blocks_are_sanitized(sample):
+    """pw-record without --raw prepended an AU header (one NaN 'sample'); a NaN anywhere made
+    whisper return nothing for its window (live 2026-11-16). The feeder must zero non-finite
+    samples and cope with blocks that split a float."""
+    raw = _load(sample, 44100)[:44100 * 8]
+    hdr = bytes.fromhex("646e732e18000000ffffffff0600000044ac000001000000")
+    data = hdr + raw.tobytes()
+    seen = []
+
+    def fake(path, opts, final):
+        import soundfile as sf
+        seen.append(sf.read(path, dtype="float32")[0])
+        return []
+
+    chunks = []
+    o = online.OnlineTranscriber(chunks, fake, lambda: {}, energy_guard=True)
+    for i in range(0, len(data), 4407):               # odd block size: floats split across blocks
+        chunks.append(data[i:i + 4407])
+    text = o.finish()
+    lv = o.levels()
+    o.close()
+    assert text == ""
+    assert o.stats["nonfinite_samples"] == 1 and lv["nonfinite"] == 0
+    assert seen and all(np.isfinite(a).all() for a in seen)
+    assert abs(lv["secs"] - (len(raw) + 6) / 44100 / 1.5) < 0.1

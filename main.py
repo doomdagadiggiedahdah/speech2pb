@@ -241,8 +241,12 @@ class Recorder:
         self.mic = preferred_mic()
         target = ["--target", self.mic] if self.mic else []
         try:
+            # --raw: without it pw-record writes an AU header to stdout (24 bytes = 6 "samples",
+            # one of them NaN). The single call never noticed (16-bit wav), but the online
+            # path streams float32, and that NaN made whisper return nothing for the first
+            # window (2026-11-16: 033932 lost its first 43s, 034322 came back empty).
             self._proc = subprocess.Popen(
-                ["pw-record", *target, "--rate", str(SAMPLE_RATE), "--channels", "1",
+                ["pw-record", "--raw", *target, "--rate", str(SAMPLE_RATE), "--channels", "1",
                  "--format", "f32", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self._reader = threading.Thread(target=self._read_pipe, daemon=True)
@@ -729,6 +733,18 @@ def main():
             log.warning("online mode failed, falling back to a single call: %s", e)
         online_extra["online"] = online_tr.stats
         online_extra["online"]["close_mic"] = online_tr.energy_guard
+        if online_text is None:   # keep what the online path heard, so the next miss is debuggable
+            try:
+                import soundfile as sf
+                lo = online_tr.tail_start or 0.0
+                diag = dict(stream=online_tr.levels(), tail=online_tr.levels(lo), tail_start=lo)
+                tail_file = AUDIO_DIR / f"online_tail_{timestamp}.wav"
+                sf.write(tail_file, online_tr.audio(lo), 16000, subtype="FLOAT")  # FLOAT keeps NaN/inf
+                diag["tail_wav"] = tail_file.name
+                online_extra["online"]["diag"] = diag
+                log.warning("online diag: %s", diag)
+            except Exception as e:
+                log.warning("online diagnostics not saved: %s", e)
         _tick("online finish (tail)")
         if online_text is not None:   # GPU queue wait (behind a batch chunk) isn't pipeline time
             _perf["online finish (tail)"] -= online_calls.tail_queued

@@ -311,7 +311,9 @@ class OnlineTranscriber:
                           inflight_at_stop=False, inflight_wait_secs=0.0, flush_secs=0.0,
                           backlog_windows_after_stop=0, segs_dropped_quality=0,
                           segs_dropped_nospeech=0, words_dropped=0,
-                          drop_why=dict(ns=0, lp=0, cr=0))
+                          drop_why=dict(ns=0, lp=0, cr=0), nonfinite_samples=0,
+                          windows_empty=0)
+        self.tail_start = None           # stretched second where the tail call started (diagnostics)
         self.stretcher = Stretcher(in_rate, tempo, self._on_pcm)
         self.feeder = threading.Thread(target=self._feed, name="online-feed", daemon=True)
         self.worker = threading.Thread(target=self._run, name="online-decode", daemon=True)
@@ -321,14 +323,25 @@ class OnlineTranscriber:
     # -- audio in ------------------------------------------------------------
     def _feed(self):
         """Copy new recorder blocks into ffmpeg every 50 ms; after stop(), drain and close."""
-        i = 0
+        i, rest = 0, b""
         try:
             while True:
                 stopping = self.stopping.is_set()      # read before draining: no block can be missed
                 new = self.chunks[i:]
                 if new:
                     i += len(new)
-                    self.stretcher.write(b"".join(new))
+                    data = rest + b"".join(new)
+                    cut = len(data) - len(data) % 4
+                    data, rest = data[:cut], data[cut:]
+                    # A single NaN/inf (e.g. a stray header) makes whisper return nothing for the
+                    # whole window it lands in: zero it before it reaches ffmpeg.
+                    pcm = np.frombuffer(data, np.float32)
+                    bad = ~np.isfinite(pcm)
+                    if bad.any():
+                        self.stats["nonfinite_samples"] += int(bad.sum())
+                        pcm = np.where(bad, np.float32(0), pcm)
+                        data = pcm.tobytes()
+                    self.stretcher.write(data)
                 if stopping:
                     break
                 time.sleep(0.05)
@@ -420,6 +433,8 @@ class OnlineTranscriber:
         segs = self._decode(c, self.audio(c, c + WINDOW), final=False)
         if segs is None:
             self.stats["windows_skipped"] += 1
+        elif not segs:                                # speech evidence but nothing kept: worth a look
+            self.stats["windows_empty"] += 1
         if not segs:                                  # silence: move on, keep a 1s overlap
             return c + WINDOW - 1.0
         allw = [tuple(w[:3]) for s in segs for w in s.get("words", [])]
@@ -454,6 +469,7 @@ class OnlineTranscriber:
                         self.stats["backlog_windows_after_stop"] += 1
                 c = self._window(c)
             tail = self.audio(c)
+            self.tail_start = c
             self.stats["tail_audio_secs"] = round(len(tail) / SR, 2)
             segs = self._decode(c, tail, final=True) if len(tail) else None
             self.stats["tail_skipped"] = segs is None
@@ -497,6 +513,15 @@ class OnlineTranscriber:
             return "".join(self.text_parts).strip()
         finally:
             self.stretcher.kill()
+
+    def levels(self, lo: float = 0.0, hi: float | None = None) -> dict:
+        """RMS/peak (dBFS) and non-finite sample count of the stretched audio in [lo, hi)."""
+        a = self.audio(lo, hi)
+        fin = a[np.isfinite(a)].astype(np.float64)
+        db = lambda x: round(20 * np.log10(x + 1e-12), 1)
+        return dict(secs=round(len(a) / SR, 2), nonfinite=int(len(a) - len(fin)),
+                    rms_db=db(np.sqrt((fin ** 2).mean())) if len(fin) else None,
+                    peak_db=db(np.abs(fin).max()) if len(fin) else None)
 
     def stretched_secs(self) -> float:
         return self.n / SR
